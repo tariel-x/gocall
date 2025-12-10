@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#2196F3">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Family Callbook">
+    <title>Family Callbook - Video & Audio Calling</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <link rel="shortcut icon" href="/favicon.ico">
+    <link rel="stylesheet" href="/styles.css">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+</head>
+
+<body>
+    <!-- Loading Spinner -->
+    <div id="loading-spinner" class="loading-spinner hidden">
+        <div class="spinner"></div>
+        <p class="loading-text" data-i18n="loading">Loading...</p>
+    </div>
+    
+    <div id="app">
+        <!-- Login Screen -->
+        <div id="login-screen" class="screen active">
+            <div class="container">
+                <h1 data-i18n="app_name">Family Callbook</h1>
+                <p class="subtitle" data-i18n="app_subtitle">Video & Audio Calling App</p>
+
+                <form id="login-form">
+                    <div class="form-group">
+                        <input type="text" id="username" data-i18n-placeholder="enter_username" placeholder="Enter your username" required
+                            autocomplete="username">
+                    </div>
+                    <button type="submit" class="btn btn-primary" data-i18n="get_started">Get Started</button>
+                </form>
+
+                <div id="login-error" class="error-message"></div>
+
+                <div class="install-prompt" id="install-prompt" style="display: none;">
+                    <p data-i18n="install_app">Install this app for a better experience!</p>
+                    <button id="install-btn" class="btn btn-secondary" data-i18n="install">Install App</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Invite Screen -->
+        <div id="invite-screen" class="screen">
+            <div class="container">
+                <h1 data-i18n="app_name">Family Callbook</h1>
+                <div id="invite-message" class="invite-message">
+                    <p id="invite-text"></p>
+                </div>
+                <button id="accept-invite-btn" class="btn btn-primary" data-i18n="accept_invite">Accept Invite</button>
+                <div id="invite-error" class="error-message"></div>
+            </div>
+        </div>
+
+        <!-- Main App Screen -->
+        <div id="app-screen" class="screen">
+            <header>
+                <h2 data-i18n="app_name">Family Callbook</h2>
+                <button id="menu-toggle" class="menu-toggle" aria-label="Menu">☰</button>
+            </header>
+            
+            <!-- Mobile Menu Overlay -->
+            <div id="mobile-menu-overlay" class="mobile-menu-overlay"></div>
+            
+            <!-- Mobile Menu -->
+            <div id="mobile-menu" class="mobile-menu">
+                <div class="mobile-menu-header">
+                    <h3 data-i18n="app_name">Family Callbook</h3>
+                    <button id="menu-close" class="menu-close" aria-label="Close">×</button>
+                </div>
+                <div class="mobile-menu-content">
+                    <div class="mobile-menu-item">
+                        <label for="mobile-language-select" data-i18n="language">Language</label>
+                        <select id="mobile-language-select" title="Select Language">
+                            <option value="en">English</option>
+                            <option value="ru">Русский</option>
+                        </select>
+                    </div>
+                    <div class="mobile-menu-item">
+                        <span id="mobile-current-username"></span>
+                    </div>
+                    <div class="mobile-menu-item">
+                        <span id="mobile-notification-status" class="notification-status" style="display: none;"></span>
+                    </div>
+                    <div class="mobile-menu-item" id="backup-restore-section" style="display: none;">
+                        <button id="backup-btn" class="btn btn-secondary" data-i18n="backup">Backup</button>
+                        <button id="restore-btn" class="btn btn-secondary" style="margin-top: 0.5rem;" data-i18n="restore">Restore</button>
+                        <input type="file" id="restore-file-input" accept=".zip" style="display: none;">
+                    </div>
+                    <div class="mobile-menu-item">
+                        <button id="mobile-logout-btn" class="btn btn-secondary" data-i18n="logout">Logout</button>
+                    </div>
+                </div>
+            </div>
+
+            <main>
+                <!-- Notification Permission Prompt -->
+                <div id="notification-prompt" class="prompt-banner" style="display: none;">
+                    <div class="prompt-content">
+                        <span>🔔 <span data-i18n="enable_notifications">Enable notifications to receive calls</span></span>
+                        <button id="enable-notifications-btn" class="btn btn-primary btn-small" data-i18n="enable">Enable</button>
+                        <button id="dismiss-notification-btn" class="btn-icon">×</button>
+                    </div>
+                </div>
+
+                <!-- Install App Prompt -->
+                <div id="install-app-prompt" class="prompt-banner" style="display: none;">
+                    <div class="prompt-content">
+                        <span>📱 <span data-i18n="install_app">Install this app for a better experience</span></span>
+                        <button id="install-app-btn" class="btn btn-primary btn-small" data-i18n="install">Install</button>
+                        <button id="dismiss-install-btn" class="btn-icon">×</button>
+                    </div>
+                </div>
+
+                <!-- Contacts Section -->
+                <section id="contacts-section">
+                    <div class="section-header">
+                        <h3 data-i18n="contacts">Contacts</h3>
+                        <button id="add-contact-btn" class="btn-icon">+</button>
+                    </div>
+                    
+                    <div id="contacts-list" class="contacts-list"></div>
+                    
+                    <div id="no-contacts" class="empty-state">
+                        <p data-i18n="no_contacts">No contacts yet. Add your first contact!</p>
+                    </div>
+                </section>
+
+                <!-- Add Contact Modal -->
+                <div id="add-contact-modal" class="modal">
+                    <div class="modal-content">
+                        <h3 data-i18n="add_contact">Add Contact</h3>
+                        <form id="add-contact-form">
+                            <div class="form-group">
+                                <input type="text" id="contact-name" data-i18n-placeholder="contact_name" placeholder="Contact name" required>
+                            </div>
+                            <div class="modal-actions">
+                                <button type="button" id="cancel-contact-btn" class="btn btn-secondary" data-i18n="cancel">Cancel</button>
+                                <button type="submit" class="btn btn-primary" data-i18n="add">Add</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Invite Modal -->
+                <div id="invite-modal" class="modal">
+                    <div class="modal-content">
+                        <h3 data-i18n="share_invite_link">Share Invite Link</h3>
+                        <p data-i18n="send_link_to_contact">Send this link to your contact:</p>
+                        <div class="invite-link-container">
+                            <input type="text" id="invite-link" readonly>
+                            <button id="copy-invite-btn" class="btn btn-secondary" data-i18n="copy">Copy</button>
+                        </div>
+                        <div class="modal-actions" style="margin-top: 1rem;">
+                            <button type="button" id="share-invite-btn" class="btn btn-primary" style="display: none;" data-i18n="share">Share</button>
+                            <button type="button" id="close-invite-btn" class="btn btn-secondary" data-i18n="close">Close</button>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- Call Screen -->
+        <div id="call-screen" class="screen">
+            <div class="call-container">
+                <div class="video-container">
+                    <video id="remote-video" autoplay playsinline></video>
+                    <video id="local-video" autoplay playsinline muted></video>
+                </div>
+
+                <div class="call-controls">
+                    <button id="mute-btn" class="btn-icon call-btn">🔇</button>
+                    <button id="video-toggle-btn" class="btn-icon call-btn">📹</button>
+                    <div class="audio-output-container">
+                        <button id="audio-output-btn" class="btn-icon call-btn" title="Switch audio output">🔊</button>
+                        <div id="audio-output-menu" class="audio-output-menu">
+                            <div class="audio-output-header">Select Audio Output</div>
+                            <div id="audio-output-list" class="audio-output-list"></div>
+                        </div>
+                    </div>
+                    <button id="end-call-btn" class="btn-icon call-btn end-call">📞</button>
+                </div>
+
+                <div class="call-info">
+                    <p id="call-status" data-i18n="connecting">Connecting...</p>
+                    <p id="call-contact-name"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+
+</html>

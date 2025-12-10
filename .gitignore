@@ -1,4 +1,8 @@
 server/keys
+server/certs
 IMPLEMENTATION.md
 familycall-server
 .vscode/sftp.json
+server/builds
+server/familycall.db
+server/familycall-server
