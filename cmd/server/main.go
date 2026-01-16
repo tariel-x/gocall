@@ -29,7 +29,6 @@ import (
 	"github.com/tariel-x/gocall/internal/handlersv2"
 	"github.com/tariel-x/gocall/internal/static"
 	"github.com/tariel-x/gocall/internal/turn"
-	"github.com/tariel-x/gocall/internal/websocket"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/acme/autocert"
@@ -60,10 +59,6 @@ func main() {
 		}
 	}
 
-	// Initialize WebSocket hub
-	hub := websocket.NewHub()
-	go hub.Run()
-
 	// Initialize TURN server
 	turnServer, err := turn.Initialize(cfg.TURNPort, cfg.TURNRealm)
 	if err != nil {
@@ -75,7 +70,7 @@ func main() {
 	logger.Info("TURN server started on port %d", cfg.TURNPort)
 
 	// Initialize handlers
-	h := handlers.New(hub, cfg, turnServer)
+	h := handlers.New(cfg, turnServer)
 
 	// Setup router
 	router := setupRouter(h, cfg)
