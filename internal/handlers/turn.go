@@ -19,12 +19,6 @@ type PushSubscribeRequest struct {
 	Keys     PushSubscribeKeys `json:"keys" binding:"required"`
 }
 
-func (h *Handlers) GetVAPIDPublicKey(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"publicKey": h.config.VAPIDKeys.PublicKey,
-	})
-}
-
 func (h *Handlers) GetTURNConfig(c *gin.Context) {
 	// Get TURN server configuration - use only our TURN server
 	// TURN servers also support STUN, so we don't need separate STUN servers

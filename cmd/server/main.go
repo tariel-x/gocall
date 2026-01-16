@@ -10,10 +10,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -40,36 +42,21 @@ var buildTimestamp = time.Now().Unix()
 
 func main() {
 	// Parse command-line flags
-	backendOnly := flag.Bool("backend-only", false, "Run in backend-only mode (disable SSL/LE, use HTTP)")
-	backendPort := flag.String("port", "", "HTTP port for backend-only mode (required with --backend-only)")
-	frontendURI := flag.String("frontend-uri", "", "Frontend URI base (e.g., https://domain.host) (required with --backend-only)")
+	httpOnly := flag.Bool("http-only", false, "Run in backend-only mode (disable SSL/LE, use HTTP)")
 	selfSigned := flag.Bool("self-signed", false, "Enable HTTPS using a generated self-signed certificate (explicitly, no localhost auto-detect)")
 	flag.Parse()
 
-	// Validate flags
-	if *backendOnly {
-		if *backendPort == "" {
-			log.Fatal("Error: --port is required when --backend-only is specified")
-		}
-		if *frontendURI == "" {
-			log.Fatal("Error: --frontend-uri is required when --backend-only is specified")
-		}
-		// Normalize frontend URI (remove trailing slash)
-		*frontendURI = strings.TrimSuffix(*frontendURI, "/")
-	}
+	cfg := config.Load(httpOnly)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	// Log version and build info
-	log.Printf("Family Callbook Server v%s (build: %d)", AppVersion, buildTimestamp)
+	logger.Info(fmt.Sprintf("Gocall Server v%s (build: %d)", AppVersion, buildTimestamp))
 
-	// Load configuration (from config.json if exists, override with flags)
-	cfg := config.Load(backendOnly, backendPort, frontendURI)
-
-	// Save config.json if flags were provided
-	if *backendOnly || (*backendPort != "" || *frontendURI != "") {
-		if err := config.SaveConfigToJSON(cfg); err != nil {
-			log.Printf("Warning: Failed to save config.json: %v", err)
-		} else {
-			log.Printf("Configuration saved to config.json")
+	// Validate flags
+	if *httpOnly {
+		if cfg.FrontendURI == "" {
+			logger.Error("Error: FRONTEND_URI is required when --http-only is specified")
+			return
 		}
 	}
 
@@ -80,11 +67,12 @@ func main() {
 	// Initialize TURN server
 	turnServer, err := turn.Initialize(cfg.TURNPort, cfg.TURNRealm)
 	if err != nil {
-		log.Fatalf("Failed to initialize TURN server: %v", err)
+		logger.Error("failed to initialize TURN server", "error", err)
+		return
 	}
 	defer turnServer.Close()
 
-	log.Printf("TURN server started on port %d", cfg.TURNPort)
+	logger.Info("TURN server started on port %d", cfg.TURNPort)
 
 	// Initialize handlers
 	h := handlers.New(hub, cfg, turnServer)
@@ -92,8 +80,8 @@ func main() {
 	// Setup router
 	router := setupRouter(h, cfg)
 
-	// Setup server (HTTPS with Let's Encrypt or HTTP for backend-only)
-	startHTTPServer(router, cfg, *selfSigned)
+	// Setup server (HTTPS and/or HTTP)
+	startServer(router, cfg, *selfSigned, logger)
 }
 
 func setupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
@@ -105,9 +93,9 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 
 	// CORS middleware (for web app)
 	router.Use(func(c *gin.Context) {
-		// Use frontend URI for CORS if in backend-only mode, otherwise allow all
+		// Use frontend URI for CORS if in http-only mode, otherwise allow all
 		origin := "*"
-		if cfg.BackendOnly && cfg.FrontendURI != "" {
+		if cfg.HTTPOnly && cfg.FrontendURI != "" {
 			origin = cfg.FrontendURI
 		}
 		c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
@@ -123,22 +111,18 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		c.Next()
 	})
 
+	// Public apiv2 routes (no auth, MVP call flow)
+	hv2 := handlersv2.New()
+
 	// Public routes
 	api := router.Group("/api")
 	{
-		api.GET("/vapid-public-key", h.GetVAPIDPublicKey)
 		api.GET("/turn-config", h.GetTURNConfig)
-	}
-
-	// Public apiv2 routes (no auth, MVP call flow)
-	hv2 := handlersv2.New()
-	apiv2 := router.Group("/apiv2")
-	{
-		apiv2.POST("/calls", hv2.CreateCall)
-		apiv2.GET("/calls/:call_id", hv2.GetCall)
-		apiv2.POST("/calls/:call_id/join", hv2.JoinCall)
-		apiv2.POST("/calls/:call_id/leave", hv2.LeaveCall)
-		apiv2.GET("/ws", hv2.HandleWebSocket)
+		api.POST("/calls", hv2.CreateCall)
+		api.GET("/calls/:call_id", hv2.GetCall)
+		api.POST("/calls/:call_id/join", hv2.JoinCall)
+		api.POST("/calls/:call_id/leave", hv2.LeaveCall)
+		api.GET("/ws", hv2.HandleWebSocket)
 	}
 
 	// New React UI routes under /newui
@@ -147,96 +131,15 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	return router
 }
 
-func startHTTPServer(router *gin.Engine, cfg *config.Config, selfSigned bool) {
-	// Backend-only mode: simple HTTP server
-	if cfg.BackendOnly {
-		httpServer := &http.Server{
-			Addr:         ":" + cfg.BackendPort,
-			Handler:      router,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		}
-
-		log.Printf("Backend-only mode: HTTP server starting on port %s", cfg.BackendPort)
-		log.Printf("Frontend URI: %s", cfg.FrontendURI)
-		log.Printf("SSL/TLS and Let's Encrypt certificate management disabled")
-		log.Printf("API calls will use: %s/api", cfg.FrontendURI)
-
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start HTTP server: %v", err)
-		}
+func startServer(router *gin.Engine, cfg *config.Config, selfSigned bool, logger *slog.Logger) {
+	// http-only mode: simple HTTP server
+	if cfg.HTTPOnly {
+		startHTTP(router, cfg, logger)
 		return
 	}
 
 	if selfSigned {
-		// Self-signed mode: HTTPS with a generated self-signed certificate
-		log.Println("Self-signed TLS enabled - generating self-signed certificate")
-
-		hosts := []string{"localhost"}
-		if cfg.Domain != "" {
-			hosts = []string{cfg.Domain}
-		}
-		certPEM, keyPEM, err := generateSelfSignedCert(hosts)
-		if err != nil {
-			log.Fatalf("Failed to generate self-signed certificate: %v", err)
-		}
-
-		cert, err := tls.X509KeyPair(certPEM, keyPEM)
-		if err != nil {
-			log.Fatalf("Failed to load self-signed certificate: %v", err)
-		}
-
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-
-		httpsServer := &http.Server{
-			Addr:         ":" + cfg.HTTPSPort,
-			Handler:      router,
-			TLSConfig:    tlsConfig,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		}
-
-		// Start HTTP redirect server
-		go func() {
-			redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				host := r.Host
-				if idx := strings.Index(host, ":"); idx != -1 {
-					host = host[:idx]
-				}
-				target := "https://" + host + ":" + cfg.HTTPSPort + r.URL.Path
-				if r.URL.RawQuery != "" {
-					target += "?" + r.URL.RawQuery
-				}
-				http.Redirect(w, r, target, http.StatusMovedPermanently)
-			})
-			httpServer := &http.Server{
-				Addr:    ":" + cfg.HTTPPort,
-				Handler: redirectHandler,
-			}
-			log.Printf("HTTP redirect server starting on port %s", cfg.HTTPPort)
-			if err := httpServer.ListenAndServe(); err != nil {
-				log.Printf("HTTP redirect server error: %v", err)
-			}
-		}()
-
-		hostForLog := cfg.Domain
-		if hostForLog == "" {
-			hostForLog = "localhost"
-		}
-		log.Printf("HTTPS server (self-signed) starting on port %s", cfg.HTTPSPort)
-		log.Printf("Access at: https://%s:%s", hostForLog, cfg.HTTPSPort)
-		log.Printf("WASM UI at: https://%s:%s/newui/", hostForLog, cfg.HTTPSPort)
-		log.Printf("WARNING: Using self-signed certificate. Your browser will show a security warning.")
-		log.Printf("         Accept the certificate to continue (safe for local development).")
-
-		if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start HTTPS server: %v", err)
-		}
+		startSelfSignedHTTPS(router, cfg, logger)
 		return
 	}
 
@@ -244,12 +147,13 @@ func startHTTPServer(router *gin.Engine, cfg *config.Config, selfSigned bool) {
 	// Get certs directory
 	certsDir := getCertsDirectory()
 	if err := os.MkdirAll(certsDir, 0700); err != nil {
-		log.Fatalf("Failed to create certs directory: %v", err)
+		logger.Error("Failed to create certs directory", "error", err)
+		return
 	}
 
 	// Normalize domain (remove www. prefix if present, convert to lowercase)
 	normalizedDomain := normalizeDomain(cfg.Domain)
-	log.Printf("Configured domain: %s (normalized: %s)", cfg.Domain, normalizedDomain)
+	logger.Info(fmt.Sprintf("Configured domain: %s (normalized: %s)", cfg.Domain, normalizedDomain))
 
 	// Configure autocert manager with custom HostPolicy for better error handling
 	m := &autocert.Manager{
@@ -310,30 +214,118 @@ func startHTTPServer(router *gin.Engine, cfg *config.Config, selfSigned bool) {
 
 	// Start HTTP server in goroutine (for Let's Encrypt challenge and redirects)
 	go func() {
-		log.Printf("HTTP server (ACME challenge & redirects) starting on port %s", cfg.HTTPPort)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start HTTP server: %v", err)
+		logger.Info(fmt.Sprintf("HTTP server (ACME challenge & redirects) starting on port %s", cfg.HTTPPort))
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Failed to start HTTP server", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	// Start certificate renewal goroutine
-	go startCertificateRenewal(m, normalizedDomain, certsDir)
+	go startCertificateRenewal(m, normalizedDomain, logger)
 
 	// Start HTTPS server
-	log.Printf("HTTPS server starting on port %s for domain: %s", cfg.HTTPSPort, normalizedDomain)
-	log.Printf("Certificates will be stored in: %s", certsDir)
-	log.Printf("Only requests for '%s' will be accepted. Other domains will be rejected.", normalizedDomain)
+	logger.Info(fmt.Sprintf("HTTPS server starting on port %s for domain: %s", cfg.HTTPSPort, normalizedDomain))
+	logger.Info(fmt.Sprintf("Certificates will be stored in: %s", certsDir))
+	logger.Info(fmt.Sprintf("Only requests for '%s' will be accepted. Other domains will be rejected.", normalizedDomain))
 	if normalizedDomain == "localhost" || normalizedDomain == "127.0.0.1" {
-		log.Println("WARNING: Let's Encrypt will not work for localhost. Use --self-signed for local development.")
+		logger.Warn("Let's Encrypt will not work for localhost. Use --self-signed for local development.")
 	}
 
-	if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Failed to start HTTPS server: %v", err)
+	if err := httpsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("Failed to start HTTPS server", "error", err)
+		return
+	}
+}
+
+func startHTTP(router *gin.Engine, cfg *config.Config, logger *slog.Logger) {
+	httpServer := &http.Server{
+		Addr:         ":" + cfg.HTTPPort,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	logger.Info("Starting HTTP server", "port", cfg.HTTPPort)
+	logger.Info(fmt.Sprintf("Frontend URI: %s", cfg.FrontendURI))
+	logger.Info(fmt.Sprintf("API calls will use: %s/api", cfg.FrontendURI))
+
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("Failed to start HTTP server", "error", err)
+	}
+}
+
+func startSelfSignedHTTPS(router *gin.Engine, cfg *config.Config, logger *slog.Logger) {
+	logger.Info("Self-signed TLS enabled - generating self-signed certificate")
+
+	hosts := []string{"localhost"}
+	if cfg.Domain != "" {
+		hosts = []string{cfg.Domain}
+	}
+	certPEM, keyPEM, err := generateSelfSignedCert(hosts)
+	if err != nil {
+		logger.Error("Failed to generate self-signed certificate", "error", err)
+		return
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		logger.Error("Failed to load self-signed certificate", "error", err)
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	httpsServer := &http.Server{
+		Addr:         ":" + cfg.HTTPSPort,
+		Handler:      router,
+		TLSConfig:    tlsConfig,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start HTTP redirect server
+	go func() {
+		redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			host := r.Host
+			if idx := strings.Index(host, ":"); idx != -1 {
+				host = host[:idx]
+			}
+			target := "https://" + host + ":" + cfg.HTTPSPort + r.URL.Path
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		})
+		httpServer := &http.Server{
+			Addr:    ":" + cfg.HTTPPort,
+			Handler: redirectHandler,
+		}
+		logger.Info(fmt.Sprintf("HTTP redirect server starting on port %s", cfg.HTTPPort))
+		if err := httpServer.ListenAndServe(); err != nil {
+			logger.Error("HTTP redirect server error: %v", "error", err)
+		}
+	}()
+
+	hostForLog := cfg.Domain
+	if hostForLog == "" {
+		hostForLog = "localhost"
+	}
+	logger.Info(fmt.Sprintf("HTTPS server (self-signed) starting on port %s", cfg.HTTPSPort))
+	logger.Info(fmt.Sprintf("Access at: https://%s:%s", hostForLog, cfg.HTTPSPort))
+
+	if err := httpsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("Failed to start HTTPS server", "error", err)
 	}
 }
 
 // startCertificateRenewal runs a background goroutine that checks and renews certificates monthly
-func startCertificateRenewal(m *autocert.Manager, domain string, certsDir string) {
+func startCertificateRenewal(m *autocert.Manager, domain string, logger *slog.Logger) {
 	// Wait a bit for initial certificate to be obtained
 	time.Sleep(30 * time.Second)
 
@@ -342,28 +334,28 @@ func startCertificateRenewal(m *autocert.Manager, domain string, certsDir string
 	defer ticker.Stop()
 
 	// Run immediately on startup, then every month
-	checkAndRenewCertificate(m, domain, certsDir)
+	checkAndRenewCertificate(m, domain, logger)
 
 	for range ticker.C {
-		checkAndRenewCertificate(m, domain, certsDir)
+		checkAndRenewCertificate(m, domain, logger)
 	}
 }
 
 // checkAndRenewCertificate checks if certificate needs renewal and triggers renewal if needed
-func checkAndRenewCertificate(m *autocert.Manager, domain string, certsDir string) {
-	log.Printf("[CERT] Checking certificate expiration for domain: %s", domain)
+func checkAndRenewCertificate(m *autocert.Manager, domain string, logger *slog.Logger) {
+	logger.Info(fmt.Sprintf("[CERT] Checking certificate expiration for domain: %s", domain))
 
 	// Get certificate from cache
 	cert, err := m.GetCertificate(&tls.ClientHelloInfo{
 		ServerName: domain,
 	})
 	if err != nil {
-		log.Printf("[CERT] Error getting certificate: %v (will be obtained on next request)", err)
+		logger.Error("[CERT] Error getting certificate (will be obtained on next request)", "error", err)
 		return
 	}
 
 	if cert == nil || len(cert.Certificate) == 0 {
-		log.Printf("[CERT] No certificate found in cache (will be obtained on next request)")
+		logger.Error("[CERT] No certificate found in cache (will be obtained on next request)")
 		return
 	}
 
@@ -377,14 +369,14 @@ func checkAndRenewCertificate(m *autocert.Manager, domain string, certsDir strin
 		var err error
 		x509Cert, err = x509.ParseCertificate(cert.Certificate[0])
 		if err != nil {
-			log.Printf("[CERT] Error parsing certificate: %v", err)
+			logger.Error("[CERT] Error parsing certificate", "error", err)
 			// Trigger renewal anyway by accessing the certificate
-			log.Printf("[CERT] Triggering certificate check/renewal for domain: %s", domain)
+			logger.Info(fmt.Sprintf("[CERT] Triggering certificate check/renewal for domain: %s", domain))
 			_, _ = m.GetCertificate(&tls.ClientHelloInfo{ServerName: domain})
 			return
 		}
 	} else {
-		log.Printf("[CERT] No certificate data available")
+		logger.Info("[CERT] No certificate data available")
 		return
 	}
 
@@ -393,28 +385,22 @@ func checkAndRenewCertificate(m *autocert.Manager, domain string, certsDir strin
 	expiresIn := x509Cert.NotAfter.Sub(now)
 	daysUntilExpiry := int(expiresIn.Hours() / 24)
 
-	log.Printf("[CERT] Certificate expires in %d days (expires: %s)", daysUntilExpiry, x509Cert.NotAfter.Format("2006-01-02"))
+	logger.Info(fmt.Sprintf("[CERT] Certificate expires in %d days (expires: %s)", daysUntilExpiry, x509Cert.NotAfter.Format("2006-01-02")))
 
 	if daysUntilExpiry < 30 {
-		log.Printf("[CERT] Certificate expires soon (%d days), triggering renewal...", daysUntilExpiry)
-		// Force renewal by getting a new certificate
-		// This will trigger autocert's renewal logic
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-
+		logger.Info(fmt.Sprintf("[CERT] Certificate expires soon (%d days), triggering renewal...", daysUntilExpiry))
 		// Create a dummy request to trigger certificate renewal
 		// The autocert manager will handle the renewal automatically
 		_, err := m.GetCertificate(&tls.ClientHelloInfo{
 			ServerName: domain,
 		})
 		if err != nil {
-			log.Printf("[CERT] Error during renewal: %v", err)
+			logger.Error("[CERT] Error during renewal", "error", err)
 		} else {
-			log.Printf("[CERT] Certificate renewal triggered successfully")
+			logger.Info("[CERT] Certificate renewal triggered successfully")
 		}
-		_ = ctx
 	} else {
-		log.Printf("[CERT] Certificate is still valid for %d more days, no renewal needed", daysUntilExpiry)
+		logger.Info(fmt.Sprintf("[CERT] Certificate is still valid for %d more days, no renewal needed", daysUntilExpiry))
 	}
 }
 
@@ -504,7 +490,7 @@ func generateSelfSignedCert(hosts []string) (certPEM, keyPEM []byte, err error) 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"Family Callbook Development"},
+			Organization: []string{"Gocall Development"},
 			CommonName:   commonName,
 		},
 		NotBefore:             notBefore,
