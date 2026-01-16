@@ -24,9 +24,9 @@ type Config struct {
 	JWTSecret    string
 	VAPIDKeys    *VAPIDKeys
 	// Backend-only mode fields
-	BackendOnly  bool
-	BackendPort  string
-	FrontendURI  string
+	BackendOnly bool
+	BackendPort string
+	FrontendURI string
 }
 
 type VAPIDKeys struct {
@@ -38,7 +38,7 @@ type VAPIDKeys struct {
 // LoadConfigFromJSON loads configuration from config.json file
 func LoadConfigFromJSON() (*Config, error) {
 	configPath := getConfigFilePath()
-	
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func LoadConfigFromJSON() (*Config, error) {
 // SaveConfigToJSON saves configuration to config.json file
 func SaveConfigToJSON(cfg *Config) error {
 	configPath := getConfigFilePath()
-	
+
 	// Create a copy without sensitive data for JSON (VAPIDKeys are stored separately)
 	configToSave := struct {
 		HTTPPort     string `json:"http_port"`
@@ -112,10 +112,10 @@ func Load(backendOnly *bool, backendPort *string, frontendURI *string) *Config {
 		fmt.Println("NOTE: Custom configuration loaded from config.json")
 		// Apply defaults for missing fields
 		if cfg.HTTPPort == "" {
-			cfg.HTTPPort = getEnv("HTTP_PORT", "80")
+			cfg.HTTPPort = getEnv("HTTP_PORT", "8080")
 		}
 		if cfg.HTTPSPort == "" {
-			cfg.HTTPSPort = getEnv("HTTPS_PORT", "443")
+			cfg.HTTPSPort = getEnv("HTTPS_PORT", "8443")
 		}
 		if cfg.TURNPort == 0 {
 			cfg.TURNPort = getEnvInt("TURN_PORT", 3478)
@@ -129,8 +129,8 @@ func Load(backendOnly *bool, backendPort *string, frontendURI *string) *Config {
 	} else {
 		// Initialize with defaults
 		cfg = &Config{
-			HTTPPort:     getEnv("HTTP_PORT", "80"),
-			HTTPSPort:    getEnv("HTTPS_PORT", "443"),
+			HTTPPort:     getEnv("HTTP_PORT", "8080"),
+			HTTPSPort:    getEnv("HTTPS_PORT", "8443"),
 			TURNPort:     getEnvInt("TURN_PORT", 3478),
 			TURNRealm:    getEnv("TURN_REALM", "familycall"),
 			DatabasePath: getEnv("DATABASE_PATH", "familycall.db"),
@@ -245,7 +245,7 @@ func loadVAPIDKeys() *VAPIDKeys {
 		if privateKeyData, err := os.ReadFile(privateKeyFile); err == nil {
 			publicKey = string(publicKeyData)
 			privateKey = string(privateKeyData)
-			
+
 			// Check if private key is in old PKCS#8 format (should be ~138 bytes when decoded)
 			// New format should be 32 bytes (raw private key)
 			decodedPrivate, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(privateKey))
@@ -309,7 +309,7 @@ func loadVAPIDKeys() *VAPIDKeys {
 	// The webpush library expects raw private key bytes, NOT PKCS#8 format
 	privateKeyBytes := make([]byte, 32)
 	privateKeyECDSA.D.FillBytes(privateKeyBytes)
-	
+
 	// Encode raw private key bytes to base64 URL-safe (no padding) for webpush library
 	// This matches the format returned by webpush.GenerateVAPIDKeys()
 	privateKeyBase64 := base64.RawURLEncoding.EncodeToString(privateKeyBytes)
@@ -434,4 +434,3 @@ func loadOrPromptDomain() string {
 
 	return domain
 }
-
