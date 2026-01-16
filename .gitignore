@@ -1,5 +1,5 @@
-server/keys
-server/certs
+keys
+certs
 .vscode
 .idea
 frontend/node_modules
