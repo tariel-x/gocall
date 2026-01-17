@@ -73,7 +73,7 @@ const WaitPage = () => {
     if (!callId) {
       return '';
     }
-    return `${window.location.origin}/newui/join/${callId}`;
+    return `${window.location.origin}/join/${callId}`;
   }, [callId]);
 
   if (!callId) {

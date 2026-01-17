@@ -20,16 +20,16 @@ export const fetchTurnConfig = async (): Promise<TurnConfig> => {
 };
 
 export const createCall = async (): Promise<CallResponse> => {
-  const { data } = await apiClient.post<CallResponse>('/apiv2/calls');
+  const { data } = await apiClient.post<CallResponse>('/api/calls');
   return data;
 };
 
 export const getCall = async (callId: string): Promise<CallDetailsResponse> => {
-  const { data } = await apiClient.get<CallDetailsResponse>(`/apiv2/calls/${callId}`);
+  const { data } = await apiClient.get<CallDetailsResponse>(`/api/calls/${callId}`);
   return data;
 };
 
 export const joinCall = async (callId: string): Promise<JoinResponse> => {
-  const { data } = await apiClient.post<JoinResponse>(`/apiv2/calls/${callId}/join`);
+  const { data } = await apiClient.post<JoinResponse>(`/api/calls/${callId}/join`);
   return data;
 };

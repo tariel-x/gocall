@@ -1,4 +1,4 @@
-package handlersv2
+package handlers
 
 import (
 	"encoding/json"
@@ -38,7 +38,7 @@ type wsStateDataV2 struct {
 	Participants callParticipants    `json:"participants"`
 }
 
-func (h *HandlersV2) HandleWebSocket(c *gin.Context) {
+func (h *Handlers) HandleWebSocket(c *gin.Context) {
 	callID := c.Query("call_id")
 	peerID := c.Query("peer_id")
 	if callID == "" {
@@ -101,7 +101,7 @@ func (h *HandlersV2) HandleWebSocket(c *gin.Context) {
 	close(stopHeartbeat)
 }
 
-func (h *HandlersV2) readPump(client *wsClientV2) {
+func (h *Handlers) readPump(client *wsClientV2) {
 	defer func() {
 		_ = client.conn.Close()
 		h.wsHub.Remove(client.callID, client.peerID)
@@ -149,7 +149,7 @@ func (h *HandlersV2) readPump(client *wsClientV2) {
 	}
 }
 
-func (h *HandlersV2) writePump(client *wsClientV2) {
+func (h *Handlers) writePump(client *wsClientV2) {
 	defer func() {
 		_ = client.conn.Close()
 	}()
@@ -176,7 +176,7 @@ func (h *HandlersV2) writePump(client *wsClientV2) {
 	}
 }
 
-func (h *HandlersV2) broadcastState(call *models.CallV2) {
+func (h *Handlers) broadcastState(call *models.CallV2) {
 	msg := stateMessage(call)
 	if len(msg) == 0 {
 		return
@@ -184,7 +184,7 @@ func (h *HandlersV2) broadcastState(call *models.CallV2) {
 	h.wsHub.Broadcast(call.ID, msg)
 }
 
-func (h *HandlersV2) heartbeatState(client *wsClientV2, stop <-chan struct{}) {
+func (h *Handlers) heartbeatState(client *wsClientV2, stop <-chan struct{}) {
 	ticker := time.NewTicker(wsHeartbeatPeriod)
 	defer ticker.Stop()
 
@@ -232,7 +232,7 @@ func stateMessage(call *models.CallV2) []byte {
 	return msg
 }
 
-func (h *HandlersV2) writeWSCallError(c *gin.Context, err error) {
+func (h *Handlers) writeWSCallError(c *gin.Context, err error) {
 	switch err {
 	case ErrCallNotFound:
 		c.JSON(http.StatusNotFound, gin.H{"error": "call not found"})

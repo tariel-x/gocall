@@ -1,4 +1,4 @@
-package handlersv2
+package handlers
 
 import (
 	"net/http"
@@ -28,7 +28,7 @@ type joinCallResponse struct {
 	PeerID string `json:"peer_id"`
 }
 
-func (h *HandlersV2) CreateCall(c *gin.Context) {
+func (h *Handlers) CreateCall(c *gin.Context) {
 	call, err := h.calls.CreateCall(h.nowFn())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -38,7 +38,7 @@ func (h *HandlersV2) CreateCall(c *gin.Context) {
 	c.JSON(http.StatusOK, createCallResponse{CallID: call.ID, Status: call.Status})
 }
 
-func (h *HandlersV2) GetCall(c *gin.Context) {
+func (h *Handlers) GetCall(c *gin.Context) {
 	callID := c.Param("call_id")
 	call, err := h.calls.GetByID(callID, h.nowFn())
 	if err != nil {
@@ -59,7 +59,7 @@ func (h *HandlersV2) GetCall(c *gin.Context) {
 	})
 }
 
-func (h *HandlersV2) JoinCall(c *gin.Context) {
+func (h *Handlers) JoinCall(c *gin.Context) {
 	callID := c.Param("call_id")
 	peerID, call, err := h.calls.Join(callID, h.nowFn())
 	if err != nil {
@@ -83,7 +83,7 @@ func (h *HandlersV2) JoinCall(c *gin.Context) {
 	c.JSON(http.StatusOK, joinCallResponse{CallID: call.ID, PeerID: peerID})
 }
 
-func (h *HandlersV2) LeaveCall(c *gin.Context) {
+func (h *Handlers) LeaveCall(c *gin.Context) {
 	callID := c.Param("call_id")
 	call, err := h.calls.EndCall(callID, h.nowFn())
 	if err != nil {

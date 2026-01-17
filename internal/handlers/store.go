@@ -1,4 +1,4 @@
-package handlersv2
+package handlers
 
 import (
 	"errors"

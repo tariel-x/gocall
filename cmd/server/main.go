@@ -24,9 +24,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/tariel-x/gocall/internal/config"
 	"github.com/tariel-x/gocall/internal/handlers"
-	"github.com/tariel-x/gocall/internal/handlersv2"
 	"github.com/tariel-x/gocall/internal/static"
 	"github.com/tariel-x/gocall/internal/turn"
 
@@ -67,10 +68,22 @@ func main() {
 	}
 	defer turnServer.Close()
 
-	logger.Info("TURN server started on port %d", cfg.TURNPort)
+	logger.Info(fmt.Sprintf("TURN server started at port %d", cfg.TURNPort))
 
-	// Initialize handlers
-	h := handlers.New(cfg, turnServer)
+	// Api routes
+	h := handlers.New(
+		cfg,
+		turnServer,
+		handlers.NewCallStore(),
+		handlers.NewWSHubV2(),
+		websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true
+			},
+		},
+	)
 
 	// Setup router
 	router := setupRouter(h, cfg)
@@ -106,18 +119,15 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		c.Next()
 	})
 
-	// Public apiv2 routes (no auth, MVP call flow)
-	hv2 := handlersv2.New()
-
 	// Public routes
 	api := router.Group("/api")
 	{
 		api.GET("/turn-config", h.GetTURNConfig)
-		api.POST("/calls", hv2.CreateCall)
-		api.GET("/calls/:call_id", hv2.GetCall)
-		api.POST("/calls/:call_id/join", hv2.JoinCall)
-		api.POST("/calls/:call_id/leave", hv2.LeaveCall)
-		api.GET("/ws", hv2.HandleWebSocket)
+		api.POST("/calls", h.CreateCall)
+		api.GET("/calls/:call_id", h.GetCall)
+		api.POST("/calls/:call_id/join", h.JoinCall)
+		api.POST("/calls/:call_id/leave", h.LeaveCall)
+		api.GET("/ws", h.HandleWebSocket)
 	}
 
 	// New React UI routes under /newui

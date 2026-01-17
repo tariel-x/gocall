@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	pathpkg "path"
 	"strings"
 
 	"github.com/tariel-x/gocall/internal/config"
@@ -21,15 +22,12 @@ const (
 //go:embed all:dist
 var distFiles embed.FS
 
-// GetFileSystem exposes the embedded dist filesystem (useful for tests/tools).
-func GetFileSystem() http.FileSystem {
-	return http.FS(distFiles)
-}
-
-// RegisterNewUIRoutes wires /newui routes to the embedded React bundle.
+// RegisterNewUIRoutes wires /* routes to the embedded React bundle.
 func RegisterNewUIRoutes(router *gin.Engine, cfg *config.Config) {
 	handler := newUIHandler(cfg)
-	router.GET("/newui/*filepath", handler)
+	// NOTE: Gin can't combine a root catch-all (e.g. /*filepath) with other
+	// top-level routes like /api. Use NoRoute as an SPA fallback instead.
+	router.NoRoute(handler)
 }
 
 func newUIHandler(cfg *config.Config) gin.HandlerFunc {
@@ -41,24 +39,41 @@ func newUIHandler(cfg *config.Config) gin.HandlerFunc {
 	}
 
 	fileServer := http.FileServer(http.FS(distFS))
-	stripHandler := http.StripPrefix("/newui", fileServer)
 
 	return func(c *gin.Context) {
-		requestPath := strings.TrimPrefix(c.Param("filepath"), "/")
-		if c.Request.URL.Path == "/newui" || c.Request.URL.Path == "/newui/" {
-			requestPath = ""
+		// Never fall back to SPA for API paths.
+		if strings.HasPrefix(c.Request.URL.Path, "/api") {
+			c.Status(http.StatusNotFound)
+			return
 		}
+
+		requestPath := strings.TrimPrefix(c.Request.URL.Path, "/")
 		if requestPath == "" || requestPath == "index.html" {
 			serveNewUIIndex(c, distFS, cfg)
 			return
 		}
 
-		if _, err := distFS.Open(requestPath); err != nil {
+		// Normalize path and prevent path traversal attempts.
+		cleaned := pathpkg.Clean("/" + requestPath)
+		if strings.HasPrefix(cleaned, "/..") {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		requestPath = strings.TrimPrefix(cleaned, "/")
+		if requestPath == "" {
 			serveNewUIIndex(c, distFS, cfg)
 			return
 		}
 
-		stripHandler.ServeHTTP(c.Writer, c.Request)
+		info, err := fs.Stat(distFS, requestPath)
+		if err != nil || info.IsDir() {
+			serveNewUIIndex(c, distFS, cfg)
+			return
+		}
+
+		// Make sure the file server sees the cleaned path.
+		c.Request.URL.Path = "/" + requestPath
+		fileServer.ServeHTTP(c.Writer, c.Request)
 		c.Abort()
 	}
 }
@@ -84,11 +99,15 @@ func serveNewUIIndex(c *gin.Context, distFS fs.FS, cfg *config.Config) {
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 	c.Header("Pragma", "no-cache")
 	c.Header("Expires", "0")
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
 	c.String(http.StatusOK, html)
 }
 
 func resolveAPIAddress(cfg *config.Config) string {
-	if cfg.BackendOnly && cfg.FrontendURI != "" {
+	if cfg.HTTPOnly && cfg.FrontendURI != "" {
 		return cfg.FrontendURI
 	}
 	return ""

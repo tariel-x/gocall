@@ -259,7 +259,7 @@ const buildWSUrl = (callId: string, peerId?: string): string => {
   const apiAddress = (window.API_ADDRESS && window.API_ADDRESS.trim() !== '')
     ? window.API_ADDRESS
     : window.location.origin;
-  const url = new URL('/apiv2/ws', apiAddress);
+  const url = new URL('/api/ws', apiAddress);
   url.searchParams.set('call_id', callId);
   if (peerId) {
     url.searchParams.set('peer_id', peerId);
