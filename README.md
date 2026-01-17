@@ -1,7 +1,7 @@
 
 # Gocall
 
-**Gocall** is a self-hosted video call service — a "poor man's Google Meet". It allows you to create one-on-one video call rooms and share links to them. No accounts, no databases, no registrations, no extra features — just simple, private calls.
+**Gocall** is a self-hosted video call service — an "extremely simplified Google Meet". It allows you to create one-on-one video call rooms and share links to them. Without accounts, databases, registrations, and extra features — just simple, private calls.
 
 ## Notice
 
