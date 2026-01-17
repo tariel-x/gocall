@@ -36,7 +36,7 @@ const StartPage = () => {
 
   return (
     <main className="page">
-      <h1>FamilyCall</h1>
+      <h1>Gocall</h1>
       <p>Создайте звонок и поделитесь ссылкой с собеседником.</p>
       <button className="primary-button" onClick={handleStartCall} disabled={isLoading}>
         {isLoading ? 'Создаём…' : 'Начать звонок'}

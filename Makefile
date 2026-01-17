@@ -1,4 +1,23 @@
-wasm:
-	rm -f ./server/static/web/app.wasm
-	GOARCH=wasm GOOS=js go build -o ./server/static/web/app.wasm ./server/internal/web/*.go
-	gzip -9 ./server/static/web/app.wasm && mv ./server/static/web/app.wasm.gz ./server/static/web/app.wasm
+FRONTEND_DIR := frontend
+DIST_DIR := internal/static/dist
+
+.PHONY: install frontend-clean frontend server all clean
+
+install:
+	cd $(FRONTEND_DIR) && npm install
+	go mod download
+
+frontend-clean:
+	rm -rf $(DIST_DIR)/*
+	touch $(DIST_DIR)/.gitkeep
+
+frontend:
+	cd $(FRONTEND_DIR) && npm run build
+
+server:
+	go build -o gocall ./cmd/server/*.go
+
+all: frontend-clean frontend server
+
+clean: frontend-clean
+	rm -f gocall

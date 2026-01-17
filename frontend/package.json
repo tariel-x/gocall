@@ -2,10 +2,10 @@
   "name": "familycall-frontend",
   "version": "0.1.0",
   "private": true,
-  "homepage": "/newui",
+  "homepage": "/",
   "scripts": {
     "start": "react-scripts start",
-    "build": "BUILD_PATH='../server/static/dist' react-scripts build",
+    "build": "BUILD_PATH='../internal/static/dist' react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"
   },
