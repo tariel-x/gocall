@@ -13,7 +13,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"math/big"
@@ -61,7 +60,7 @@ func main() {
 	}
 
 	// Initialize TURN server
-	turnServer, err := turn.Initialize(cfg.TURNPort, cfg.TURNRealm)
+	turnServer, err := turn.Initialize(cfg.TURNPort, cfg.TURNRealm, logger)
 	if err != nil {
 		logger.Error("failed to initialize TURN server", "error", err)
 		return
@@ -86,18 +85,22 @@ func main() {
 	)
 
 	// Setup router
-	router := setupRouter(h, cfg)
+	router := setupRouter(h, cfg, logger)
 
 	// Setup server (HTTPS and/or HTTP)
 	startServer(router, cfg, *selfSigned, logger)
 }
 
-func setupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
+func setupRouter(h *handlers.Handlers, cfg *config.Config, logger *slog.Logger) *gin.Engine {
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.Recovery())
+	if logger != nil {
+		router.Use(slogGinLogger(logger))
+	}
 
 	// CORS middleware (for web app)
 	router.Use(func(c *gin.Context) {
@@ -193,8 +196,8 @@ func startServer(router *gin.Engine, cfg *config.Config, selfSigned bool, logger
 		redirectHandler.ServeHTTP(w, r)
 	})
 
-	// Create a custom error logger that filters out TLS handshake errors for unauthorized hosts
-	errorLog := log.New(&tlsErrorFilter{writer: os.Stderr}, "", log.LstdFlags)
+	// net/http errors (including TLS handshake errors) -> slog JSON
+	errorLog := log.New(newTLSErrorWriter(logger), "", 0)
 
 	// Create HTTP server for Let's Encrypt challenge and redirects (port 80)
 	httpServer := &http.Server{
@@ -250,6 +253,7 @@ func startHTTP(router *gin.Engine, cfg *config.Config, logger *slog.Logger) {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		ErrorLog:     log.New(newTLSErrorWriter(logger), "", 0),
 	}
 
 	logger.Info("Starting HTTP server", "port", cfg.HTTPPort)
@@ -292,6 +296,7 @@ func startSelfSignedHTTPS(router *gin.Engine, cfg *config.Config, logger *slog.L
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		ErrorLog:     log.New(newTLSErrorWriter(logger), "", 0),
 	}
 
 	// Start HTTP redirect server
@@ -308,12 +313,13 @@ func startSelfSignedHTTPS(router *gin.Engine, cfg *config.Config, logger *slog.L
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		})
 		httpServer := &http.Server{
-			Addr:    ":" + cfg.HTTPPort,
-			Handler: redirectHandler,
+			Addr:     ":" + cfg.HTTPPort,
+			Handler:  redirectHandler,
+			ErrorLog: log.New(newTLSErrorWriter(logger), "", 0),
 		}
 		logger.Info(fmt.Sprintf("HTTP redirect server starting on port %s", cfg.HTTPPort))
 		if err := httpServer.ListenAndServe(); err != nil {
-			logger.Error("HTTP redirect server error: %v", "error", err)
+			logger.Error("HTTP redirect server error", "error", err)
 		}
 	}()
 
@@ -418,20 +424,6 @@ func getCertsDirectory() string {
 	}
 	execDir := filepath.Dir(execPath)
 	return filepath.Join(execDir, "certs")
-}
-
-// tlsErrorFilter filters out TLS handshake errors for unauthorized hosts
-type tlsErrorFilter struct {
-	writer io.Writer
-}
-
-func (f *tlsErrorFilter) Write(p []byte) (n int, err error) {
-	msg := string(p)
-	// Filter out TLS handshake errors for unauthorized hosts
-	if strings.Contains(msg, "TLS handshake error") && strings.Contains(msg, "not configured") {
-		return len(p), nil // Discard the message
-	}
-	return f.writer.Write(p)
 }
 
 // normalizeDomain normalizes a domain name for comparison
