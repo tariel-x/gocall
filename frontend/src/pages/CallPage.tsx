@@ -13,42 +13,16 @@ import { CallStatus, PeerRole } from '../services/types';
 import { SignalingClient, SignalingSubscription, subscribeToSignaling } from '../services/signaling';
 import type { WSState } from '../hooks/useSignaling';
 
-const STATUS_BADGES = {
-  waiting: 'status-badge status-waiting',
-  active: 'status-badge status-active',
-  ended: 'status-badge status-ended',
-  connecting: 'status-badge status-connecting',
-  ready: 'status-badge status-ready',
-  disconnected: 'status-badge status-disconnected',
-} as const;
-
-type StatusTone = keyof typeof STATUS_BADGES;
-
-const CALL_STATUS_TEXT: Record<CallStatus, string> = {
-  waiting: 'Ждём подключение',
-  active: 'Звонок идёт',
-  ended: 'Звонок завершён',
-};
-
-const CALL_STATUS_TONE: Record<CallStatus, StatusTone> = {
-  waiting: 'waiting',
-  active: 'active',
-  ended: 'ended',
-};
-
-const WS_STATE_META: Record<WSState, { label: string; tone: StatusTone }> = {
-  connecting: { label: 'Сигналинг подключается', tone: 'connecting' },
-  ready: { label: 'Сигналинг активен', tone: 'ready' },
-  disconnected: { label: 'Сигналинг отключён', tone: 'disconnected' },
-};
-
-type MediaRouteMode = 'unknown' | 'direct' | 'relay';
-
-const MEDIA_ROUTE_META: Record<MediaRouteMode, { label: string; tone: StatusTone }> = {
-  unknown: { label: 'Маршрут определяется', tone: 'waiting' },
-  direct: { label: 'Напрямую (P2P)', tone: 'ready' },
-  relay: { label: 'Через TURN', tone: 'ready' },
-};
+import {
+  MediaRouteMode, 
+  getPeerStateMeta, 
+  getIceStateMeta, 
+  getBadgeClass,
+  CALL_STATUS_TONE,
+  CALL_STATUS_TEXT,
+  WS_STATE_META, 
+  MEDIA_ROUTE_META, 
+} from '../hooks/uiConsts';
 
 const describeCandidate = (candidate: any) => {
   if (!candidate) {
@@ -71,40 +45,6 @@ const describeCandidate = (candidate: any) => {
   return segments.join(' · ');
 };
 
-const getPeerStateMeta = (state: RTCPeerConnectionState | 'new'): { label: string; tone: StatusTone } => {
-  switch (state) {
-    case 'connected':
-      return { label: 'WebRTC подключён', tone: 'ready' };
-    case 'connecting':
-      return { label: 'WebRTC подключается', tone: 'connecting' };
-    case 'disconnected':
-      return { label: 'WebRTC отключён', tone: 'disconnected' };
-    case 'failed':
-    case 'closed':
-      return { label: 'WebRTC завершён', tone: 'ended' };
-    default:
-      return { label: 'Ожидание WebRTC', tone: 'waiting' };
-  }
-};
-
-const getIceStateMeta = (state: RTCIceConnectionState | 'new'): { label: string; tone: StatusTone } => {
-  switch (state) {
-    case 'connected':
-    case 'completed':
-      return { label: 'ICE подключён', tone: 'ready' };
-    case 'checking':
-      return { label: 'ICE проверяет маршруты', tone: 'connecting' };
-    case 'disconnected':
-      return { label: 'ICE отключён', tone: 'disconnected' };
-    case 'failed':
-    case 'closed':
-      return { label: 'ICE завершён', tone: 'ended' };
-    default:
-      return { label: 'Ожидание ICE', tone: 'waiting' };
-  }
-};
-
-const getBadgeClass = (tone: StatusTone) => STATUS_BADGES[tone] || STATUS_BADGES.waiting;
 
 const CallPage = () => {
   const { callId } = useParams<{ callId: string }>();
