@@ -220,15 +220,16 @@ body {
 }
 
 .danger-button {
-  padding: 14px 22px;
-  border-radius: 999px;
+  padding: 10px 16px;
+  border-radius: 8px;
   border: none;
-  font-size: 0.95rem;
+  font-size: 0.9rem;
   font-weight: 600;
   background: linear-gradient(135deg, #fb7185, #f97316);
   color: #0f172a;
   cursor: pointer;
   transition: opacity 150ms ease, transform 150ms ease;
+  white-space: nowrap;
 }
 
 .danger-button:hover {
@@ -324,6 +325,163 @@ body {
   line-height: 1.35;
 }
 
+/* New Call Page Layout */
+.call-page-new {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #020617;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.call-top-area {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000000;
+}
+
+.remote-video-container {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  background: #000000;
+}
+
+.remote-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #000000;
+}
+
+.local-video-floating {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  width: calc(100% / 5);
+  aspect-ratio: auto;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 2px solid rgba(226, 232, 240, 0.3);
+  background: rgba(2, 6, 23, 0.9);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.local-video-floating .local-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 0;
+  display: block;
+}
+
+.local-video-floating .video-placeholder {
+  position: absolute;
+  inset: 0;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.status-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(15, 23, 42, 0.95);
+  border-top: 1px solid rgba(148, 163, 184, 0.3);
+  z-index: 20;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.status-overlay-content {
+  padding: 24px;
+}
+
+.call-bottom-bar {
+  height: 96px;
+  background: rgba(15, 23, 42, 0.92);
+  border-top: 1px solid rgba(148, 163, 184, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  gap: 16px;
+  z-index: 15;
+  flex-shrink: 0;
+}
+
+.bottom-left-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.status-text-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.call-status-text {
+  margin: 0;
+  color: #e2e8f0;
+  font-size: 0.95rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.call-error-text {
+  margin: 0;
+  color: #fca5a5;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status-toggle-button {
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(226, 232, 240, 0.3);
+  background: rgba(226, 232, 240, 0.08);
+  color: #e2e8f0;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 150ms ease, border-color 150ms ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.status-toggle-button:hover {
+  background: rgba(226, 232, 240, 0.15);
+  border-color: rgba(226, 232, 240, 0.5);
+}
+
 @media (max-width: 768px) {
   body {
     align-items: flex-start;
@@ -347,5 +505,41 @@ body {
 
   .remote-video {
     height: clamp(220px, 45vh, 360px);
+  }
+
+  /* Mobile adjustments for new layout */
+  .call-bottom-bar {
+    height: 96px;
+    padding: 12px 16px;
+  }
+
+  .bottom-left-section {
+    gap: 6px;
+  }
+
+  .danger-button {
+    padding: 8px 12px;
+    font-size: 0.8rem;
+  }
+
+  .status-toggle-button {
+    padding: 8px 12px;
+    font-size: 0.75rem;
+  }
+
+  .call-status-text {
+    font-size: 0.8rem;
+  }
+
+  .status-overlay {
+    bottom: 0;
+  }
+
+  .status-overlay-content {
+    padding: 16px;
+  }
+
+  .call-status-grid {
+    grid-template-columns: repeat(2, 1fr);
   }
 }
