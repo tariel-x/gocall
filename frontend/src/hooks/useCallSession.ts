@@ -77,10 +77,12 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const offerSentRef = useRef(false);
   
   // Обновляем connectionParamsRef при изменении sessionInfo
-  connectionParamsRef.current = {
-    peerId: sessionInfo.peerId,
-    role: sessionInfo.role ?? connectionParamsRef.current.role ?? 'host',
-  };
+  useEffect(() => {
+    connectionParamsRef.current = {
+      peerId: sessionInfo.peerId,
+      role: sessionInfo.role ?? connectionParamsRef.current.role ?? 'host',
+    };
+  }, [sessionInfo.peerId, sessionInfo.role]);
 
   useEffect(() => {
     if (!callId) {
@@ -265,7 +267,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
-  const createOffer = useCallback(async () => {
+  const createOfferRef = useRef<() => Promise<void>>();
+  createOfferRef.current = async () => {
     const pc = pcRef.current;
     if (!pc || offerSentRef.current) {
       return;
@@ -280,25 +283,58 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       console.error('[CALL] Failed to create offer', err);
       setError('Не удалось создать предложение для звонка. Попробуйте перезагрузить страницу.');
     }
-  }, [sendSignal]);
+  };
 
-  // Проверка условий для auto-offer (host должен создать offer когда готов)
-  const checkAndCreateOffer = useCallback(() => {
+  // Auto-offer для host: проверяем условия после обновления participants и wsState
+  // Используем useEffect вместо setTimeout для надёжной реакции на изменения состояния
+  useEffect(() => {
+    // Защита от преждевременного срабатывания: проверяем, что инициализация завершена
+    if (!pcRef.current) {
+      return;
+    }
+    
+    // Проверяем условия для создания offer
     if (connectionParamsRef.current.role !== 'host') {
       return;
     }
     if (participants < 2 || wsState !== 'ready') {
       return;
     }
-    if (!pcRef.current || offerSentRef.current) {
+    if (offerSentRef.current) {
       return;
     }
-    createOffer();
-  }, [participants, wsState, createOffer]);
+    
+    // Все условия выполнены - создаём offer
+    createOfferRef.current?.();
+  }, [participants, wsState]);
+
+  // Очищаем transientMessage когда соединение установлено или появился remoteStream
+  // Это позволяет показать более актуальное сообщение вместо "Ответ получен..."
+  useEffect(() => {
+    if (!transientMessage) {
+      return;
+    }
+    
+    // Очищаем если соединение полностью установлено
+    const isConnected = 
+      callStatus === 'active' &&
+      peerConnectionState === 'connected' &&
+      (iceConnectionState === 'connected' || iceConnectionState === 'completed');
+    
+    // Или если появился remoteStream (это тоже признак работающего соединения)
+    if (isConnected || remoteStream) {
+      setTransientMessage(null);
+    }
+  }, [transientMessage, callStatus, peerConnectionState, iceConnectionState, remoteStream]);
 
   useEffect(() => {
     if (!callId) {
       setError('Не указан идентификатор звонка. Вернитесь на главный экран.');
+      return;
+    }
+
+    // Защита от повторной инициализации: если сессия уже активна, не инициализируем заново
+    if (pcRef.current || signalingRef.current) {
       return;
     }
 
@@ -403,8 +439,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
             setPeerContext(data.peer_id, resolvedRole);
             setSessionInfo((prev) => ({ ...prev, peerId: data.peer_id, role: resolvedRole }));
           }
-          // Проверяем условия для auto-offer после onJoin
-          setTimeout(() => checkAndCreateOffer(), 0);
+          // Проверка условий для auto-offer выполнится автоматически через useEffect
+          // при обновлении wsState
         },
         onState: (data) => {
           if (!isActive) {
@@ -415,10 +451,9 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           setParticipants(newParticipants);
           if (data.status === 'ended') {
             teardownSession();
-          } else {
-            // Проверяем условия для auto-offer после обновления participants
-            setTimeout(() => checkAndCreateOffer(), 0);
           }
+          // Проверка условий для auto-offer выполнится автоматически через useEffect
+          // при обновлении participants
         },
         onOffer: (message) => {
           if (!isActive || connectionParamsRef.current.role === 'host') {
@@ -477,7 +512,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       isActive = false;
       teardownSession({ preserveState: true });
     };
-  }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, sendSignal, teardownSession, updateMediaRoute, checkAndCreateOffer]);
+  }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, sendSignal, teardownSession, updateMediaRoute]);
 
   const hangup = useCallback(() => {
     setCallStatus('ended');
