@@ -55,8 +55,9 @@ func (s *CallStore) CreateCall(now time.Time) (*models.CallV2, error) {
 		UpdatedAt: now,
 		ExpiresAt: now.Add(s.callTTL),
 		Host: models.CallParticipantV2{
-			JoinedAt:  now,
-			IsPresent: true,
+			JoinedAt:       now,
+			IsPresent:      true,
+			ReconnectCount: 0,
 		},
 	}
 
@@ -127,9 +128,10 @@ func (s *CallStore) Join(callID string, now time.Time) (peerID string, call *mod
 	}
 
 	call.Guest = models.CallParticipantV2{
-		PeerID:    id,
-		JoinedAt:  now,
-		IsPresent: true,
+		PeerID:         id,
+		JoinedAt:       now,
+		IsPresent:      true,
+		ReconnectCount: 0,
 	}
 	call.Status = models.CallStatusV2Active
 	call.UpdatedAt = now
@@ -186,12 +188,22 @@ func (s *CallStore) ValidatePeer(callID, peerID string, now time.Time) (role Pee
 
 	switch {
 	case peerID != "" && peerID == call.Host.PeerID:
+		wasPresent := call.Host.IsPresent
 		call.Host.IsPresent = true
+		if !wasPresent {
+			call.Host.ReconnectCount++
+		}
+		call.Host.DisconnectedAt = time.Time{}
 		call.UpdatedAt = now
 		call.ExpiresAt = now.Add(s.callTTL)
 		return PeerRoleV2Host, call, nil
 	case peerID != "" && peerID == call.Guest.PeerID:
+		wasPresent := call.Guest.IsPresent
 		call.Guest.IsPresent = true
+		if !wasPresent {
+			call.Guest.ReconnectCount++
+		}
+		call.Guest.DisconnectedAt = time.Time{}
 		call.UpdatedAt = now
 		call.ExpiresAt = now.Add(s.callTTL)
 		return PeerRoleV2Guest, call, nil
@@ -216,6 +228,30 @@ func (s *CallStore) EndCall(callID string, now time.Time) (*models.CallV2, error
 	s.removeCallLocked(callID)
 
 	return &snapshot, nil
+}
+
+// MarkPeerDisconnected flags peer presence as lost but keeps the call active to allow reconnection.
+func (s *CallStore) MarkPeerDisconnected(callID, peerID string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	call, ok := s.calls[callID]
+	if !ok {
+		return
+	}
+
+	switch {
+	case peerID == call.Host.PeerID:
+		call.Host.IsPresent = false
+		call.Host.DisconnectedAt = now
+	case peerID == call.Guest.PeerID:
+		call.Guest.IsPresent = false
+		call.Guest.DisconnectedAt = now
+	default:
+		return
+	}
+
+	call.UpdatedAt = now
 }
 
 func (s *CallStore) loadActiveCallLocked(callID string, now time.Time) (*models.CallV2, error) {

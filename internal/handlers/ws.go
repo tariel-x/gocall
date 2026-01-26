@@ -104,6 +104,7 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 func (h *Handlers) readPump(client *wsClientV2) {
 	defer func() {
 		_ = client.conn.Close()
+		h.calls.MarkPeerDisconnected(client.callID, client.peerID, h.nowFn())
 		h.wsHub.Remove(client.callID, client.peerID)
 
 		// Do not end the call on disconnect.
