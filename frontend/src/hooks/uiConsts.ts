@@ -26,6 +26,7 @@ export const CALL_STATUS_TONE: Record<CallStatus, StatusTone> = {
 
 export const WS_STATE_META: Record<WSState, { label: string; tone: StatusTone }> = {
   connecting: { label: 'Сигналинг подключается', tone: 'connecting' },
+  reconnecting: { label: 'Сигналинг переподключается', tone: 'connecting' },
   ready: { label: 'Сигналинг активен', tone: 'ready' },
   disconnected: { label: 'Сигналинг отключён', tone: 'disconnected' },
 };

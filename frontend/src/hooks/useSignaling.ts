@@ -3,7 +3,7 @@ import { subscribeToSignaling, SignalingSubscription } from '../services/signali
 import { setPeerContext } from '../services/session';
 import { CallStatus, PeerRole } from '../services/types';
 
-export type WSState = 'connecting' | 'ready' | 'disconnected';
+export type WSState = 'connecting' | 'reconnecting' | 'ready' | 'disconnected';
 
 interface SignalingOptions {
   callId?: string;
@@ -42,6 +42,9 @@ export const useSignaling = ({
 
     setWsState('connecting');
     const subscription = subscribeToSignaling(callId as string, peerId, {
+      onOpen: () => setWsState('ready'),
+      onReconnecting: () => setWsState('reconnecting'),
+      onReconnected: () => setWsState('ready'),
       onJoin: (data) => {
         if (data?.peer_id) {
           setPeerContext(data.peer_id, (data.role as PeerRole) ?? 'host');
@@ -51,8 +54,8 @@ export const useSignaling = ({
       onState: (data) => {
         stateCallbackRef.current?.(data.status, data.participants?.count ?? 1);
       },
-      onClose: () => setWsState('disconnected'),
-      onError: () => setWsState('disconnected'),
+        onClose: () => setWsState('disconnected'),
+        onError: () => setWsState('reconnecting'),
     });
     subscriptionRef.current = subscription;
 
