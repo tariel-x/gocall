@@ -34,6 +34,8 @@ const CallPage = () => {
     iceConnectionState,
     mediaRoute,
     transientMessage,
+    reconnectionState,
+    peerDisconnected,
   } = state;
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -69,17 +71,28 @@ const CallPage = () => {
       return transientMessage;
     }
     
-    // Приоритет 2: callStatus === 'ended'
+    // Приоритет 2: состояние переподключения / потеря собеседника
+    if (reconnectionState === 'peer-disconnected' || peerDisconnected) {
+      return 'Собеседник отключился. Ждём переподключения...';
+    }
+    if (reconnectionState === 'reconnecting') {
+      return 'Переподключаем соединение...';
+    }
+    if (reconnectionState === 'failed') {
+      return 'Не удалось восстановить соединение. Попробуйте перезапустить звонок.';
+    }
+
+    // Приоритет 3: callStatus === 'ended'
     if (callStatus === 'ended') {
       return 'Звонок завершён.';
     }
     
-    // Приоритет 3: remoteStream подключен
+    // Приоритет 4: remoteStream подключен
     if (remoteStream && !error) {
       return 'Видео собеседника подключено.';
     }
 
-    // Приоритет 4: соединение установлено
+    // Приоритет 5: соединение установлено
     if (
       !error &&
       callStatus === 'active' &&
@@ -89,12 +102,12 @@ const CallPage = () => {
       return 'Соединение установлено.';
     }
     
-    // Приоритет 5: активный звонок, но соединение ещё устанавливается
+    // Приоритет 6: активный звонок, но соединение ещё устанавливается
     if (callStatus === 'active' && participants >= 2) {
       return 'Собеседник подключился. Устанавливаем медиасоединение...';
     }
     
-    // Приоритет 6: по умолчанию
+    // Приоритет 7: по умолчанию
     return 'Готовим звонок…';
   };
   
@@ -117,6 +130,19 @@ const CallPage = () => {
   const iceStateMeta = getIceStateMeta(iceConnectionState);
   const wsStateMeta = WS_STATE_META[wsState];
   const mediaRouteMeta = MEDIA_ROUTE_META[mediaRoute.mode];
+
+  const reconnectionLabel = (() => {
+    switch (reconnectionState) {
+      case 'reconnecting':
+        return 'Переподключение...';
+      case 'peer-disconnected':
+        return 'Собеседник отключён';
+      case 'failed':
+        return 'Восстановление не удалось';
+      default:
+        return null;
+    }
+  })();
 
   return (
     <main className="call-page-new">
@@ -151,6 +177,12 @@ const CallPage = () => {
                   <span className="status-label">ICE</span>
                   <span className={getBadgeClass(iceStateMeta.tone)}>{iceStateMeta.label}</span>
                 </div>
+                {reconnectionLabel && (
+                  <div className="call-stat">
+                    <span className="status-label">Переподключение</span>
+                    <span className={getBadgeClass('connecting')}>{reconnectionLabel}</span>
+                  </div>
+                )}
                 <div className="call-stat">
                   <span className="status-label">Медиа-канал</span>
                   <span className={getBadgeClass(mediaRouteMeta.tone)}>{mediaRouteMeta.label}</span>
@@ -172,6 +204,9 @@ const CallPage = () => {
             {hangupLabel}
           </button>
           <div className="status-text-container">
+            {reconnectionLabel && (
+              <span className="status-badge status-connecting">{reconnectionLabel}</span>
+            )}
             {infoMessage && <p className="call-status-text">{infoMessage}</p>}
             {error && <p className="call-error-text">{error}</p>}
           </div>

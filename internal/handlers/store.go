@@ -22,6 +22,7 @@ type CallStore struct {
 	calls           map[string]*models.CallV2
 	statusIndex     map[models.CallStatusV2]map[string]struct{}
 	callTTL         time.Duration
+	reconnectTTL    time.Duration
 	cleanupInterval time.Duration
 }
 
@@ -33,6 +34,7 @@ func NewCallStore() *CallStore {
 			models.CallStatusV2Active:  {},
 		},
 		callTTL:         30 * time.Minute,
+		reconnectTTL:    30 * time.Minute,
 		cleanupInterval: 3 * time.Hour,
 	}
 	go s.cleanupLoop()
@@ -177,13 +179,13 @@ const (
 	PeerRoleV2Guest PeerRoleV2 = "guest"
 )
 
-func (s *CallStore) ValidatePeer(callID, peerID string, now time.Time) (role PeerRoleV2, call *models.CallV2, err error) {
+func (s *CallStore) ValidatePeer(callID, peerID string, now time.Time) (role PeerRoleV2, call *models.CallV2, reconnected bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	call, err = s.loadActiveCallLocked(callID, now)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 
 	switch {
@@ -196,7 +198,7 @@ func (s *CallStore) ValidatePeer(callID, peerID string, now time.Time) (role Pee
 		call.Host.DisconnectedAt = time.Time{}
 		call.UpdatedAt = now
 		call.ExpiresAt = now.Add(s.callTTL)
-		return PeerRoleV2Host, call, nil
+		return PeerRoleV2Host, call, !wasPresent, nil
 	case peerID != "" && peerID == call.Guest.PeerID:
 		wasPresent := call.Guest.IsPresent
 		call.Guest.IsPresent = true
@@ -206,9 +208,9 @@ func (s *CallStore) ValidatePeer(callID, peerID string, now time.Time) (role Pee
 		call.Guest.DisconnectedAt = time.Time{}
 		call.UpdatedAt = now
 		call.ExpiresAt = now.Add(s.callTTL)
-		return PeerRoleV2Guest, call, nil
+		return PeerRoleV2Guest, call, !wasPresent, nil
 	default:
-		return "", call, errors.New("invalid peer_id")
+		return "", call, false, errors.New("invalid peer_id")
 	}
 }
 
@@ -252,6 +254,7 @@ func (s *CallStore) MarkPeerDisconnected(callID, peerID string, now time.Time) {
 	}
 
 	call.UpdatedAt = now
+	// Не обновляем ExpiresAt, чтобы использовать reconnectTTL логически
 }
 
 func (s *CallStore) loadActiveCallLocked(callID string, now time.Time) (*models.CallV2, error) {
@@ -265,7 +268,7 @@ func (s *CallStore) loadActiveCallLocked(callID string, now time.Time) (*models.
 		return nil, ErrCallEnded
 	}
 
-	if !call.ExpiresAt.IsZero() && now.After(call.ExpiresAt) {
+	if s.isExpired(call, now) {
 		s.markEndedLocked(call, now)
 		s.removeCallLocked(callID)
 		return nil, ErrCallEnded
@@ -292,11 +295,35 @@ func (s *CallStore) cleanupExpiredLocked(now time.Time) {
 			s.removeCallLocked(id)
 			continue
 		}
-		if !call.ExpiresAt.IsZero() && now.After(call.ExpiresAt) {
+		if s.isExpired(call, now) {
 			s.markEndedLocked(call, now)
 			s.removeCallLocked(id)
 		}
 	}
+}
+
+func (s *CallStore) isExpired(call *models.CallV2, now time.Time) bool {
+	if call == nil {
+		return true
+	}
+
+	// Usual TTL expiry
+	if !call.ExpiresAt.IsZero() && now.After(call.ExpiresAt) {
+		return true
+	}
+
+	// Reconnect window: if оба участника отсутствуют дольше reconnectTTL
+	if !call.Host.IsPresent && !call.Guest.IsPresent {
+		latestDisc := call.Host.DisconnectedAt
+		if call.Guest.DisconnectedAt.After(latestDisc) {
+			latestDisc = call.Guest.DisconnectedAt
+		}
+		if !latestDisc.IsZero() && now.After(latestDisc.Add(s.reconnectTTL)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *CallStore) markEndedLocked(call *models.CallV2, now time.Time) {

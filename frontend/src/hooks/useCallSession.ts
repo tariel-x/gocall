@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchTurnConfig } from '../services/api';
 import { acquireLocalMedia, getLocalStream, releaseLocalStream } from '../services/media';
 import { getSessionState, setCallContext, setPeerContext, SessionState } from '../services/session';
-import { CallStatus, PeerRole } from '../services/types';
+import { CallStatus, PeerRole, ReconnectionState } from '../services/types';
 import { SignalingClient, SignalingSubscription, subscribeToSignaling } from '../services/signaling';
 import type { WSState } from './useSignaling';
 import { MediaRouteMode } from './uiConsts';
@@ -40,6 +40,8 @@ export interface UseCallSessionState {
   iceConnectionState: RTCIceConnectionState | 'new';
   mediaRoute: { mode: MediaRouteMode; detail?: string };
   transientMessage: string | null;
+  reconnectionState: ReconnectionState;
+  peerDisconnected: boolean;
 }
 
 export interface UseCallSessionActions {
@@ -69,12 +71,16 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState | 'new'>('new');
   const [mediaRoute, setMediaRoute] = useState<{ mode: MediaRouteMode; detail?: string }>({ mode: 'unknown' });
   const [transientMessage, setTransientMessage] = useState<string | null>(null);
+  const [reconnectionState, setReconnectionState] = useState<ReconnectionState>('connected');
+  const [peerDisconnected, setPeerDisconnected] = useState(false);
 
   const signalingRef = useRef<SignalingClient | null>(null);
   const signalingSubscriptionRef = useRef<SignalingSubscription | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const offerSentRef = useRef(false);
+  const iceRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const peerDisconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   // Обновляем connectionParamsRef при изменении sessionInfo
   useEffect(() => {
@@ -95,6 +101,33 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const resetMediaRoute = useCallback(() => {
     setMediaRoute({ mode: 'unknown' });
   }, []);
+
+  const resetPeerReconnection = useCallback(() => {
+    setPeerDisconnected(false);
+    setReconnectionState('connected');
+    if (peerDisconnectTimerRef.current) {
+      clearTimeout(peerDisconnectTimerRef.current);
+      peerDisconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const handlePeerReconnected = useCallback(
+    (options?: { fromJoin?: boolean }) => {
+      resetPeerReconnection();
+      pendingCandidatesRef.current = [];
+      offerSentRef.current = false;
+      setTransientMessage('Собеседник восстановил соединение.');
+
+      // Хост инициирует новое предложение / ICE restart, гость ожидает
+      if (connectionParamsRef.current.role === 'host') {
+        void performIceRestart();
+      } else if (!options?.fromJoin) {
+        // Гость ожидает новое предложение
+        setTransientMessage('Ожидаем новое предложение после переподключения...');
+      }
+    },
+    [performIceRestart, resetPeerReconnection]
+  );
 
   const updateMediaRoute = useCallback(async () => {
     const pc = pcRef.current;
@@ -174,6 +207,14 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         signalingRef.current = null;
       }
     }
+    if (iceRestartTimerRef.current) {
+      clearTimeout(iceRestartTimerRef.current);
+      iceRestartTimerRef.current = null;
+    }
+    if (peerDisconnectTimerRef.current) {
+      clearTimeout(peerDisconnectTimerRef.current);
+      peerDisconnectTimerRef.current = null;
+    }
     if (pcRef.current) {
       pcRef.current.onicecandidate = null;
       pcRef.current.ontrack = null;
@@ -191,6 +232,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       setPeerConnectionState('new');
       setIceConnectionState('new');
       setWsState('disconnected');
+      setReconnectionState('connected');
+      setPeerDisconnected(false);
       resetMediaRoute();
     }
   }, [resetMediaRoute]);
@@ -202,6 +245,33 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
     signalingRef.current.send({ type, data });
   }, []);
+
+  const performIceRestart = useCallback(async () => {
+    const pc = pcRef.current;
+    if (!pc) {
+      return;
+    }
+
+    // Инициируем ICE restart со стороны хоста, гость ожидает новое предложение
+    if (connectionParamsRef.current.role !== 'host') {
+      setTransientMessage('Ожидаем переподключение собеседника...');
+      setReconnectionState('reconnecting');
+      return;
+    }
+
+    try {
+      setTransientMessage('Переподключаем медиасессию...');
+      setReconnectionState('reconnecting');
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+      offerSentRef.current = true;
+      sendSignal('offer', offer);
+    } catch (err) {
+      console.error('[CALL] ICE restart failed', err);
+      setError('Не удалось переподключить медиасессию. Попробуйте создать новую ссылку.');
+      setReconnectionState('failed');
+    }
+  }, [sendSignal]);
 
   const flushPendingCandidates = useCallback(async () => {
     const pc = pcRef.current;
@@ -235,7 +305,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       setTransientMessage('Отправили ответ. Ждём подключение...');
     } catch (err) {
       console.error('[CALL] Failed to handle offer', err);
-      setError('Не удалось обработать предложение от собеседника. Перезагрузите страницу и попробуйте снова.');
+      setError('Не удалось обработать предложение от собеседника. Попробуйте создать новую ссылку.');
     }
   }, [flushPendingCandidates, sendSignal]);
 
@@ -250,7 +320,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       setTransientMessage('Ответ получен. Устанавливаем соединение...');
     } catch (err) {
       console.error('[CALL] Failed to handle answer', err);
-      setError('Не удалось применить ответ собеседника. Попробуйте перезапустить звонок.');
+      setError('Не удалось применить ответ собеседника. Попробуйте создать новую ссылку.');
     }
   }, [flushPendingCandidates]);
 
@@ -281,7 +351,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       offerSentRef.current = true;
     } catch (err) {
       console.error('[CALL] Failed to create offer', err);
-      setError('Не удалось создать предложение для звонка. Попробуйте перезагрузить страницу.');
+      setError('Не удалось создать предложение для звонка. Попробуйте создать новую ссылку.');
     }
   };
 
@@ -421,9 +491,30 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         const state = pc.iceConnectionState ?? 'new';
         setIceConnectionState(state);
         if (state === 'connected' || state === 'completed') {
+          if (iceRestartTimerRef.current) {
+            clearTimeout(iceRestartTimerRef.current);
+            iceRestartTimerRef.current = null;
+          }
+          setReconnectionState('connected');
           void updateMediaRoute();
         }
-        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+        if (state === 'disconnected') {
+          if (iceRestartTimerRef.current) {
+            clearTimeout(iceRestartTimerRef.current);
+          }
+          setReconnectionState('reconnecting');
+          iceRestartTimerRef.current = setTimeout(() => {
+            if (pcRef.current?.iceConnectionState === 'disconnected') {
+              void performIceRestart();
+            }
+          }, 3000);
+        }
+        if (state === 'failed') {
+          resetMediaRoute();
+          setReconnectionState('reconnecting');
+          void performIceRestart();
+        }
+        if (state === 'closed') {
           resetMediaRoute();
         }
       };
@@ -439,6 +530,16 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
             setPeerContext(data.peer_id, resolvedRole);
             setSessionInfo((prev) => ({ ...prev, peerId: data.peer_id, role: resolvedRole }));
           }
+          const isReconnect = (data as any)?.is_reconnect === true;
+          const peerOnline = (data as any)?.peer_online === true;
+          if (isReconnect) {
+            setReconnectionState('reconnecting');
+            setTransientMessage('Восстанавливаем соединение...');
+            handlePeerReconnected({ fromJoin: true });
+          }
+          if (peerOnline) {
+            resetPeerReconnection();
+          }
           // Проверка условий для auto-offer выполнится автоматически через useEffect
           // при обновлении wsState
         },
@@ -449,10 +550,20 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           const newParticipants = data.participants?.count ?? 1;
           setCallStatus(data.status);
           setParticipants(newParticipants);
+          if (newParticipants >= 2 && peerDisconnectTimerRef.current) {
+            clearTimeout(peerDisconnectTimerRef.current);
+            peerDisconnectTimerRef.current = null;
+          }
           if (data.status === 'ended') {
             teardownSession();
           }
           // Проверка условий для auto-offer выполнится автоматически через useEffect
+        onReconnected: () => {
+          if (!isActive) {
+            return;
+          }
+          handlePeerReconnected();
+        },
           // при обновлении participants
         },
         onOffer: (message) => {
@@ -486,8 +597,36 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           if (!isActive) {
             return;
           }
-          setCallStatus('ended');
-          teardownSession();
+          setTransientMessage('Собеседник отключился. Ждём переподключения...');
+          setPeerDisconnected(true);
+          setReconnectionState('peer-disconnected');
+          if (peerDisconnectTimerRef.current) {
+            clearTimeout(peerDisconnectTimerRef.current);
+          }
+          peerDisconnectTimerRef.current = setTimeout(() => {
+            setCallStatus('ended');
+            teardownSession();
+          }, 30000);
+        },
+        onMessage: (envelope) => {
+          if (!isActive || !envelope?.type) {
+            return;
+          }
+          if (envelope.type === 'peer-disconnected') {
+            setPeerDisconnected(true);
+            setReconnectionState('peer-disconnected');
+            setTransientMessage('Собеседник отключился. Ждём переподключения...');
+            if (peerDisconnectTimerRef.current) {
+              clearTimeout(peerDisconnectTimerRef.current);
+            }
+            peerDisconnectTimerRef.current = setTimeout(() => {
+              setCallStatus('ended');
+              teardownSession();
+            }, 30000);
+          }
+          if (envelope.type === 'peer-reconnected') {
+            handlePeerReconnected();
+          }
         },
         onClose: () => {
           if (!isActive) {
@@ -512,7 +651,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       isActive = false;
       teardownSession({ preserveState: true });
     };
-  }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, sendSignal, teardownSession, updateMediaRoute]);
+  }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, resetPeerReconnection, sendSignal, teardownSession, updateMediaRoute]);
 
   const hangup = useCallback(() => {
     setCallStatus('ended');
@@ -532,6 +671,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       iceConnectionState,
       mediaRoute,
       transientMessage,
+      reconnectionState,
+      peerDisconnected,
     },
     actions: {
       setTransientMessage,

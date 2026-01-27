@@ -28,8 +28,10 @@ type wsEnvelopeV2 struct {
 }
 
 type wsJoinDataV2 struct {
-	PeerID string     `json:"peer_id"`
-	Role   PeerRoleV2 `json:"role"`
+	PeerID      string     `json:"peer_id"`
+	Role        PeerRoleV2 `json:"role"`
+	IsReconnect bool       `json:"is_reconnect"`
+	PeerOnline  bool       `json:"peer_online"`
 }
 
 type wsStateDataV2 struct {
@@ -50,6 +52,7 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 
 	var role PeerRoleV2
 	var call *models.CallV2
+	reconnected := false
 	if peerID == "" {
 		var err error
 		peerID, call, err = h.calls.EnsureHostPeerID(callID, now)
@@ -60,7 +63,7 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 		role = PeerRoleV2Host
 	} else {
 		var err error
-		role, call, err = h.calls.ValidatePeer(callID, peerID, now)
+		role, call, reconnected, err = h.calls.ValidatePeer(callID, peerID, now)
 		if err != nil {
 			if err.Error() == "invalid peer_id" {
 				c.JSON(http.StatusForbidden, gin.H{"error": "invalid peer_id"})
@@ -88,9 +91,19 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 	// Initial join ack to the client.
 	joinMsg, _ := json.Marshal(wsEnvelopeV2{
 		Type: "join",
-		Data: mustMarshal(wsJoinDataV2{PeerID: peerID, Role: role}),
+		Data: mustMarshal(wsJoinDataV2{
+			PeerID:      peerID,
+			Role:        role,
+			IsReconnect: reconnected,
+			PeerOnline:  otherPeerOnline(call, peerID),
+		}),
 	})
 	client.send <- joinMsg
+
+	if reconnected {
+		reconnectMsg, _ := json.Marshal(wsEnvelopeV2{Type: "peer-reconnected", From: peerID})
+		h.wsHub.SendToOther(callID, peerID, reconnectMsg)
+	}
 
 	h.broadcastState(call)
 
@@ -109,8 +122,8 @@ func (h *Handlers) readPump(client *wsClientV2) {
 
 		// Do not end the call on disconnect.
 		// Clients may navigate between SPA screens and reconnect.
-		leaveMsg, _ := json.Marshal(wsEnvelopeV2{Type: "leave", From: client.peerID})
-		h.wsHub.SendToOther(client.callID, client.peerID, leaveMsg)
+		disconnectMsg, _ := json.Marshal(wsEnvelopeV2{Type: "peer-disconnected", From: client.peerID})
+		h.wsHub.SendToOther(client.callID, client.peerID, disconnectMsg)
 	}()
 
 	_ = client.conn.SetReadDeadline(time.Now().Add(wsPongWait))
@@ -214,6 +227,16 @@ func (h *Handlers) heartbeatState(client *wsClientV2, stop <-chan struct{}) {
 			return
 		}
 	}
+}
+
+func otherPeerOnline(call *models.CallV2, selfPeerID string) bool {
+	if call == nil {
+		return false
+	}
+	if selfPeerID == call.Host.PeerID {
+		return call.Guest.IsPresent
+	}
+	return call.Host.IsPresent
 }
 
 func stateMessage(call *models.CallV2) []byte {
