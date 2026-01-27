@@ -111,24 +111,6 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
-  const handlePeerReconnected = useCallback(
-    (options?: { fromJoin?: boolean }) => {
-      resetPeerReconnection();
-      pendingCandidatesRef.current = [];
-      offerSentRef.current = false;
-      setTransientMessage('Собеседник восстановил соединение.');
-
-      // Хост инициирует новое предложение / ICE restart, гость ожидает
-      if (connectionParamsRef.current.role === 'host') {
-        void performIceRestart();
-      } else if (!options?.fromJoin) {
-        // Гость ожидает новое предложение
-        setTransientMessage('Ожидаем новое предложение после переподключения...');
-      }
-    },
-    [performIceRestart, resetPeerReconnection]
-  );
-
   const updateMediaRoute = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc) {
@@ -272,6 +254,24 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       setReconnectionState('failed');
     }
   }, [sendSignal]);
+
+  const handlePeerReconnected = useCallback(
+    (options?: { fromJoin?: boolean }) => {
+      resetPeerReconnection();
+      pendingCandidatesRef.current = [];
+      offerSentRef.current = false;
+      setTransientMessage('Собеседник восстановил соединение.');
+
+      // Хост инициирует новое предложение / ICE restart, гость ожидает
+      if (connectionParamsRef.current.role === 'host') {
+        void performIceRestart();
+      } else if (!options?.fromJoin) {
+        // Гость ожидает новое предложение
+        setTransientMessage('Ожидаем новое предложение после переподключения...');
+      }
+    },
+    [performIceRestart, resetPeerReconnection]
+  );
 
   const flushPendingCandidates = useCallback(async () => {
     const pc = pcRef.current;
@@ -558,13 +558,13 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
             teardownSession();
           }
           // Проверка условий для auto-offer выполнится автоматически через useEffect
+          // при обновлении participants
+        },
         onReconnected: () => {
           if (!isActive) {
             return;
           }
           handlePeerReconnected();
-        },
-          // при обновлении participants
         },
         onOffer: (message) => {
           if (!isActive || connectionParamsRef.current.role === 'host') {
