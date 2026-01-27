@@ -1,3 +1,39 @@
+/**
+ * useCallSession Hook
+ * ====================
+ * 
+ * This hook encapsulates all WebRTC call logic for a video call session.
+ * It manages:
+ * - WebSocket signaling connection lifecycle
+ * - RTCPeerConnection setup and state
+ * - ICE candidate exchange and connectivity
+ * - Media stream acquisition and attachment
+ * - Reconnection handling (both WebSocket and WebRTC)
+ * - Peer disconnection detection and recovery
+ * 
+ * Architecture Overview:
+ * ----------------------
+ * 1. Session initialization (triggered by callId)
+ * 2. Local media acquisition (camera/microphone)
+ * 3. TURN server configuration fetch
+ * 4. RTCPeerConnection creation with ICE servers
+ * 5. WebSocket signaling subscription
+ * 6. SDP offer/answer exchange (host creates offer, guest answers)
+ * 7. ICE candidate trickle exchange
+ * 8. Connection established -> media flows
+ * 
+ * Reconnection Flow:
+ * ------------------
+ * - On ICE disconnected: wait 3s, then ICE restart (host-initiated)
+ * - On ICE failed: immediate ICE restart
+ * - On peer WebSocket disconnect: show warning, wait 30s for reconnect
+ * - On WebSocket reconnect: renegotiate WebRTC session
+ * 
+ * Role-based behavior:
+ * --------------------
+ * - Host: Creates SDP offer, initiates ICE restarts
+ * - Guest: Waits for offer, responds with answer
+ */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchTurnConfig } from '../services/api';
 import { acquireLocalMedia, getLocalStream, releaseLocalStream } from '../services/media';
@@ -7,6 +43,11 @@ import { SignalingClient, SignalingSubscription, subscribeToSignaling } from '..
 import type { WSState } from './useSignaling';
 import { MediaRouteMode } from './uiConsts';
 
+/**
+ * Formats an ICE candidate into a human-readable string for debugging.
+ * Extracts candidate type (host/srflx/relay), network type, relay protocol,
+ * and address:port information.
+ */
 const describeCandidate = (candidate: any) => {
   if (!candidate) {
     return '';
@@ -28,19 +69,36 @@ const describeCandidate = (candidate: any) => {
   return segments.join(' · ');
 };
 
+/**
+ * Exported state from useCallSession hook.
+ * All reactive state that the UI needs to render the call page.
+ */
 export interface UseCallSessionState {
+  /** Current session metadata (callId, peerId, role) */
   sessionInfo: SessionState;
+  /** WebSocket signaling connection state */
   wsState: WSState;
+  /** High-level call status: waiting/active/ended */
   callStatus: CallStatus;
+  /** Number of participants in the call (1 or 2) */
   participants: number;
+  /** Error message to display, if any */
   error: string | null;
+  /** Remote peer's MediaStream (video/audio) */
   remoteStream: MediaStream | null;
+  /** Local MediaStream (camera/mic) */
   localStreamState: MediaStream | null;
+  /** RTCPeerConnection state: new/connecting/connected/disconnected/failed/closed */
   peerConnectionState: RTCPeerConnectionState | 'new';
+  /** ICE connection state: new/checking/connected/completed/disconnected/failed/closed */
   iceConnectionState: RTCIceConnectionState | 'new';
+  /** Media route info: direct P2P or via TURN relay */
   mediaRoute: { mode: MediaRouteMode; detail?: string };
+  /** Temporary status message (cleared automatically when connection established) */
   transientMessage: string | null;
+  /** Reconnection state: connected/reconnecting/peer-disconnected/failed */
   reconnectionState: ReconnectionState;
+  /** True when the remote peer has disconnected (WebSocket level) */
   peerDisconnected: boolean;
 }
 
@@ -55,7 +113,14 @@ export interface UseCallSessionResult {
 }
 
 export function useCallSession(callId: string | undefined): UseCallSessionResult {
+  // ============================================================
+  // REACTIVE STATE
+  // These trigger re-renders and are exposed to the UI
+  // ============================================================
   const [sessionInfo, setSessionInfo] = useState<SessionState>(() => getSessionState());
+  
+  // Ref to hold connection params without triggering re-renders.
+  // Used inside callbacks to get current role/peerId without stale closures.
   const connectionParamsRef = useRef<{ peerId?: string; role: PeerRole }>({
     peerId: sessionInfo.peerId,
     role: sessionInfo.role ?? 'host',
@@ -74,15 +139,25 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const [reconnectionState, setReconnectionState] = useState<ReconnectionState>('connected');
   const [peerDisconnected, setPeerDisconnected] = useState(false);
 
-  const signalingRef = useRef<SignalingClient | null>(null);
-  const signalingSubscriptionRef = useRef<SignalingSubscription | null>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const offerSentRef = useRef(false);
-  const iceRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const peerDisconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // ============================================================
+  // REFS (mutable, non-reactive)
+  // Used for WebRTC objects and timers that shouldn't trigger renders
+  // ============================================================
+  const signalingRef = useRef<SignalingClient | null>(null);           // WebSocket client
+  const signalingSubscriptionRef = useRef<SignalingSubscription | null>(null); // Subscription handle
+  const pcRef = useRef<RTCPeerConnection | null>(null);                // RTCPeerConnection instance
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);      // ICE candidates received before remote description set
+  const offerSentRef = useRef(false);                                  // Guard to prevent duplicate offers
+  const iceRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // Timer for delayed ICE restart
+  const peerDisconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Timer for peer disconnect timeout (30s)
   
-  // Обновляем connectionParamsRef при изменении sessionInfo
+  // ============================================================
+  // SYNC EFFECTS
+  // Keep refs in sync with reactive state for use in callbacks
+  // ============================================================
+  
+  // Keep connectionParamsRef synchronized with sessionInfo changes.
+  // This allows callbacks to access current role/peerId without stale closures.
   useEffect(() => {
     connectionParamsRef.current = {
       peerId: sessionInfo.peerId,
@@ -90,6 +165,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     };
   }, [sessionInfo.peerId, sessionInfo.role]);
 
+  // When callId changes (from URL), update the session context.
+  // This persists the callId to sessionStorage for potential recovery.
   useEffect(() => {
     if (!callId) {
       return;
@@ -98,10 +175,17 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     setSessionInfo((prev) => ({ ...prev, callId }));
   }, [callId]);
 
+  // ============================================================
+  // UTILITY CALLBACKS
+  // Small helper functions for state resets
+  // ============================================================
+  
+  /** Reset media route detection to unknown state */
   const resetMediaRoute = useCallback(() => {
     setMediaRoute({ mode: 'unknown' });
   }, []);
 
+  /** Reset peer reconnection state and clear any pending disconnect timer */
   const resetPeerReconnection = useCallback(() => {
     setPeerDisconnected(false);
     setReconnectionState('connected');
@@ -111,6 +195,18 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
+  // ============================================================
+  // MEDIA ROUTE DETECTION
+  // Inspects RTCPeerConnection stats to determine if media flows
+  // directly (P2P) or via TURN relay server
+  // ============================================================
+  
+  /**
+   * Queries RTCPeerConnection stats to determine the active ICE candidate pair.
+   * Updates mediaRoute state with:
+   * - mode: 'direct' (P2P) or 'relay' (via TURN)
+   * - detail: human-readable info about local/remote candidates
+   */
   const updateMediaRoute = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc) {
@@ -176,6 +272,19 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
+  // ============================================================
+  // SESSION TEARDOWN
+  // Cleanup function for all WebRTC and signaling resources
+  // ============================================================
+  
+  /**
+   * Tears down the entire call session:
+   * - Unsubscribes from signaling WebSocket
+   * - Clears all pending timers
+   * - Closes RTCPeerConnection
+   * - Releases local media tracks
+   * - Optionally preserves state (for component unmount without full reset)
+   */
   const teardownSession = useCallback((options?: { preserveState?: boolean }) => {
     if (signalingSubscriptionRef.current) {
       signalingSubscriptionRef.current.unsubscribe();
@@ -220,6 +329,12 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, [resetMediaRoute]);
 
+  // ============================================================
+  // SIGNALING HELPERS
+  // Functions for sending messages via WebSocket
+  // ============================================================
+  
+  /** Send a signaling message via WebSocket (offer, answer, ice-candidate, etc.) */
   const sendSignal = useCallback((type: string, data?: unknown) => {
     if (!signalingRef.current) {
       console.warn('[CALL] Signaling is not ready, unable to send', type);
@@ -228,6 +343,16 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     signalingRef.current.send({ type, data });
   }, []);
 
+  // ============================================================
+  // ICE RESTART
+  // Handles WebRTC reconnection when ICE connectivity is lost
+  // ============================================================
+  
+  /**
+   * Performs an ICE restart to recover from connectivity issues.
+   * Only the host initiates the restart (creates new offer with iceRestart: true).
+   * The guest waits for the new offer from the host.
+   */
   const performIceRestart = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc) {
@@ -255,6 +380,14 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, [sendSignal]);
 
+  /**
+   * Handles peer reconnection event (when the other participant reconnects).
+   * Resets state and initiates renegotiation:
+   * - Host: creates new offer (ICE restart)
+   * - Guest: waits for new offer from host
+   * 
+   * @param options.fromJoin - true if called during initial join (skip waiting message for guest)
+   */
   const handlePeerReconnected = useCallback(
     (options?: { fromJoin?: boolean }) => {
       resetPeerReconnection();
@@ -273,6 +406,15 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     [performIceRestart, resetPeerReconnection]
   );
 
+  // ============================================================
+  // SDP & ICE CANDIDATE HANDLERS
+  // Process signaling messages from the remote peer
+  // ============================================================
+  
+  /**
+   * Flushes ICE candidates that arrived before the remote description was set.
+   * Called after setRemoteDescription to apply buffered candidates.
+   */
   const flushPendingCandidates = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc || !pc.remoteDescription) {
@@ -291,6 +433,10 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
+  /**
+   * Handles an incoming SDP offer from the remote peer (guest receives this).
+   * Sets remote description, creates answer, and sends it back.
+   */
   const handleRemoteOffer = useCallback(async (description: RTCSessionDescriptionInit) => {
     const pc = pcRef.current;
     if (!pc) {
@@ -309,6 +455,10 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, [flushPendingCandidates, sendSignal]);
 
+  /**
+   * Handles an incoming SDP answer from the remote peer (host receives this).
+   * Completes the offer/answer exchange by setting the remote description.
+   */
   const handleRemoteAnswer = useCallback(async (description: RTCSessionDescriptionInit) => {
     const pc = pcRef.current;
     if (!pc) {
@@ -324,6 +474,10 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, [flushPendingCandidates]);
 
+  /**
+   * Handles an incoming ICE candidate from the remote peer.
+   * If remote description isn't set yet, buffers the candidate for later.
+   */
   const handleRemoteCandidate = useCallback(async (candidate: RTCIceCandidateInit) => {
     const pc = pcRef.current;
     if (!pc || !pc.remoteDescription) {
@@ -337,6 +491,12 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
+  // ============================================================
+  // OFFER CREATION
+  // Host creates and sends SDP offer to initiate WebRTC connection
+  // ============================================================
+  
+  // Ref-based function to create offer (allows calling from effects without deps issues)
   const createOfferRef = useRef<() => Promise<void>>();
   createOfferRef.current = async () => {
     const pc = pcRef.current;
@@ -355,55 +515,103 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   };
 
-  // Auto-offer для host: проверяем условия после обновления participants и wsState
-  // Используем useEffect вместо setTimeout для надёжной реакции на изменения состояния
+  // ============================================================
+  // AUTO-OFFER EFFECT
+  // Automatically creates offer when conditions are met (host only)
+  // ============================================================
+  
+  /**
+   * Auto-offer for host: triggers offer creation when:
+   * 1. RTCPeerConnection is initialized
+   * 2. Current role is 'host'
+   * 3. Both participants are connected (participants >= 2)
+   * 4. WebSocket is ready
+   * 5. Offer hasn't been sent yet
+   * 
+   * Using useEffect ensures reliable reaction to state changes.
+   */
   useEffect(() => {
-    // Защита от преждевременного срабатывания: проверяем, что инициализация завершена
+    // Guard: ensure initialization is complete
     if (!pcRef.current) {
       return;
     }
     
-    // Проверяем условия для создания offer
+    // Only host creates offers
     if (connectionParamsRef.current.role !== 'host') {
       return;
     }
+    // Need both participants and ready signaling
     if (participants < 2 || wsState !== 'ready') {
       return;
     }
+    // Prevent duplicate offers
     if (offerSentRef.current) {
       return;
     }
     
-    // Все условия выполнены - создаём offer
+    // All conditions met - create offer
     createOfferRef.current?.();
   }, [participants, wsState]);
 
-  // Очищаем transientMessage когда соединение установлено или появился remoteStream
-  // Это позволяет показать более актуальное сообщение вместо "Ответ получен..."
+  // ============================================================
+  // TRANSIENT MESSAGE CLEANUP
+  // Auto-clears status messages when connection is established
+  // ============================================================
+  
+  /**
+   * Clears transient status messages when the connection is fully established.
+   * This prevents stale messages like "Waiting for response..." from showing
+   * after the call is already working.
+   * 
+   * Clears when:
+   * - Call is active AND WebRTC connected AND ICE connected/completed
+   * - OR when remoteStream is received (media is flowing)
+   */
   useEffect(() => {
     if (!transientMessage) {
       return;
     }
     
-    // Очищаем если соединение полностью установлено
+    // Clear if connection is fully established
     const isConnected = 
       callStatus === 'active' &&
       peerConnectionState === 'connected' &&
       (iceConnectionState === 'connected' || iceConnectionState === 'completed');
     
-    // Или если появился remoteStream (это тоже признак работающего соединения)
+    // Also clear if remoteStream is received (media is flowing)
     if (isConnected || remoteStream) {
       setTransientMessage(null);
     }
   }, [transientMessage, callStatus, peerConnectionState, iceConnectionState, remoteStream]);
 
+  // ============================================================
+  // MAIN INITIALIZATION EFFECT
+  // Sets up the entire call session when callId is available
+  // ============================================================
+  
+  /**
+   * Main effect that initializes the call session.
+   * Runs when callId changes (typically once on mount).
+   * 
+   * Initialization sequence:
+   * 1. Validate callId and session state
+   * 2. Acquire local media (camera/microphone)
+   * 3. Fetch TURN server configuration
+   * 4. Create RTCPeerConnection with ICE servers
+   * 5. Add local tracks to peer connection
+   * 6. Set up RTCPeerConnection event handlers
+   * 7. Subscribe to signaling WebSocket
+   * 8. Process incoming signaling messages
+   * 
+   * Cleanup on unmount tears down the session (preserving state for potential recovery).
+   */
   useEffect(() => {
     if (!callId) {
       setError('Не указан идентификатор звонка. Вернитесь на главный экран.');
       return;
     }
 
-    // Защита от повторной инициализации: если сессия уже активна, не инициализируем заново
+    // Guard against re-initialization if session is already active
     if (pcRef.current || signalingRef.current) {
       return;
     }
@@ -414,15 +622,18 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       return;
     }
 
+    // Flag to prevent state updates after unmount
     let isActive = true;
 
     const init = async () => {
+      // Reset state for fresh initialization
       setError(null);
       setTransientMessage(null);
       setCallStatus('waiting');
       setParticipants(1);
       setWsState('connecting');
 
+      // ----- STEP 1: Acquire local media (camera/microphone) -----
       let mediaStream: MediaStream | null = null;
       try {
         mediaStream = await acquireLocalMedia();
@@ -435,6 +646,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         return;
       }
 
+      // ----- STEP 2: Fetch TURN server configuration -----
       let rtcConfig: RTCConfiguration = {};
       try {
         const turnConfig = await fetchTurnConfig();
@@ -448,9 +660,11 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         console.warn('[CALL] Failed to load TURN config', err);
       }
 
+      // ----- STEP 3: Create RTCPeerConnection -----
       const pc = new RTCPeerConnection(rtcConfig);
       pcRef.current = pc;
 
+      // ----- STEP 4: Add local tracks to peer connection -----
       if (mediaStream) {
         const streamForTracks = mediaStream;
         streamForTracks.getTracks().forEach((track) => {
@@ -458,12 +672,16 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         });
       }
 
+      // ----- STEP 5: Set up RTCPeerConnection event handlers -----
+      
+      // Send ICE candidates to remote peer via signaling
       pc.onicecandidate = (event) => {
         if (event.candidate) {
           sendSignal('ice-candidate', event.candidate.toJSON());
         }
       };
 
+      // Receive remote media tracks
       pc.ontrack = (event) => {
         if (!isActive) {
           return;
@@ -474,6 +692,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         }
       };
 
+      // Track overall peer connection state changes
       pc.onconnectionstatechange = () => {
         if (!isActive) {
           return;
@@ -484,12 +703,15 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         }
       };
 
+      // Handle ICE connectivity state changes (for reconnection logic)
       pc.oniceconnectionstatechange = () => {
         if (!isActive) {
           return;
         }
         const state = pc.iceConnectionState ?? 'new';
         setIceConnectionState(state);
+        
+        // ICE connected: clear any pending restart timer, update media route
         if (state === 'connected' || state === 'completed') {
           if (iceRestartTimerRef.current) {
             clearTimeout(iceRestartTimerRef.current);
@@ -498,6 +720,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           setReconnectionState('connected');
           void updateMediaRoute();
         }
+        
+        // ICE disconnected: wait 3s then attempt ICE restart
         if (state === 'disconnected') {
           if (iceRestartTimerRef.current) {
             clearTimeout(iceRestartTimerRef.current);
@@ -509,17 +733,23 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
             }
           }, 3000);
         }
+        
+        // ICE failed: immediate ICE restart attempt
         if (state === 'failed') {
           resetMediaRoute();
           setReconnectionState('reconnecting');
           void performIceRestart();
         }
+        
         if (state === 'closed') {
           resetMediaRoute();
         }
       };
 
+      // ----- STEP 6: Subscribe to WebSocket signaling -----
+      // This sets up handlers for all signaling messages from the server
       const subscription = subscribeToSignaling(callId, peerId, {
+        // Called when successfully joined the call room
         onJoin: (data) => {
           if (!isActive) {
             return;
@@ -653,11 +883,18 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     };
   }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, resetPeerReconnection, sendSignal, teardownSession, updateMediaRoute]);
 
+  // ============================================================
+  // PUBLIC ACTIONS
+  // Actions exposed to the UI for user interactions
+  // ============================================================
+  
+  /** End the call and cleanup all resources */
   const hangup = useCallback(() => {
     setCallStatus('ended');
     teardownSession();
   }, [teardownSession]);
 
+  // Return state and actions for the UI
   return {
     state: {
       sessionInfo,
