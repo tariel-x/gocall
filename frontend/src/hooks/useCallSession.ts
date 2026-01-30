@@ -153,6 +153,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const peerDisconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Timer for peer disconnect timeout (30s)
   const recreateAttemptsRef = useRef(0);                               // Counter for peer connection recreate attempts
   const isRecreatingRef = useRef(false);                               // Guard to prevent concurrent recreations
+  const recreateRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Timer for delayed recreate retry
   const lastRtcConfigRef = useRef<RTCConfiguration>({});               // Cached RTC config for recreations
   const setupPcHandlersRef = useRef<((pc: RTCPeerConnection) => void) | null>(null); // Ref to setup handlers function
   
@@ -200,7 +201,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
   }, []);
 
-  /** Clear all ICE-related timers */
+  /** Clear all ICE-related and recreate timers */
   const clearIceTimers = useCallback(() => {
     if (iceRestartTimerRef.current) {
       clearTimeout(iceRestartTimerRef.current);
@@ -209,6 +210,10 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     if (iceRestartFallbackTimerRef.current) {
       clearTimeout(iceRestartFallbackTimerRef.current);
       iceRestartFallbackTimerRef.current = null;
+    }
+    if (recreateRetryTimerRef.current) {
+      clearTimeout(recreateRetryTimerRef.current);
+      recreateRetryTimerRef.current = null;
     }
   }, []);
 
@@ -498,10 +503,43 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     } catch (err) {
       console.error('[CALL] Failed to recreate peer connection', err);
       isRecreatingRef.current = false;
-      // Try again
-      void recreatePeerConnection({ fetchNewTurnConfig: true });
+      // Schedule retry after 2 seconds if we have attempts left
+      scheduleRecreateRetryRef.current?.();
     }
   }, [clearIceTimers, resetMediaRoute, sendSignal]);
+
+  // Ref for scheduleRecreateRetry to avoid circular dependency
+  const scheduleRecreateRetryRef = useRef<(() => void) | null>(null);
+
+  /**
+   * Schedules a retry of recreatePeerConnection after 2 seconds.
+   * Used when recreation fails or ICE fails after recreation.
+   */
+  const scheduleRecreateRetry = useCallback(() => {
+    const maxAttempts = 3;
+    if (recreateAttemptsRef.current >= maxAttempts) {
+      console.error('[CALL] Max recreate attempts reached, giving up');
+      setError('Не удалось восстановить соединение после нескольких попыток. Попробуйте создать новую ссылку.');
+      setReconnectionState('failed');
+      return;
+    }
+
+    // Clear any existing retry timer
+    if (recreateRetryTimerRef.current) {
+      clearTimeout(recreateRetryTimerRef.current);
+    }
+
+    console.log(`[CALL] Scheduling recreate retry in 2 seconds (attempt ${recreateAttemptsRef.current + 1}/${maxAttempts})`);
+    setTransientMessage(`Повторная попытка через 2 секунды (${recreateAttemptsRef.current}/${maxAttempts})...`);
+
+    recreateRetryTimerRef.current = setTimeout(() => {
+      recreateRetryTimerRef.current = null;
+      void recreatePeerConnection({ fetchNewTurnConfig: true });
+    }, 2000);
+  }, [recreatePeerConnection]);
+
+  // Keep ref in sync
+  scheduleRecreateRetryRef.current = scheduleRecreateRetry;
 
   /**
    * Handles peer reconnection event (when the other participant reconnects).
@@ -885,13 +923,19 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
             }, 3000);
           }
           
-          // ICE failed: immediately try to recreate the connection
+          // ICE failed: try to recreate the connection (with retry logic)
           if (state === 'failed') {
             clearIceTimers();
             resetMediaRoute();
             setReconnectionState('reconnecting');
-            // ICE restart won't help if it already failed - recreate the connection
-            void recreatePeerConnection({ fetchNewTurnConfig: true });
+            // If this is after a recreate attempt, schedule retry with delay
+            // Otherwise start first recreate immediately
+            if (recreateAttemptsRef.current > 0) {
+              isRecreatingRef.current = false;
+              scheduleRecreateRetryRef.current?.();
+            } else {
+              void recreatePeerConnection({ fetchNewTurnConfig: true });
+            }
           }
           
           if (state === 'closed') {
