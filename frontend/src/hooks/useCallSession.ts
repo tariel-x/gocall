@@ -1047,16 +1047,11 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           if (!isActive) {
             return;
           }
-          setTransientMessage('Собеседник отключился. Ждём переподключения...');
-          setPeerDisconnected(true);
-          setReconnectionState('peer-disconnected');
-          if (peerDisconnectTimerRef.current) {
-            clearTimeout(peerDisconnectTimerRef.current);
-          }
-          peerDisconnectTimerRef.current = setTimeout(() => {
-            setCallStatus('ended');
-            teardownSession();
-          }, 30000);
+          // Intentional leave from peer - end call immediately
+          console.log('[CALL] Peer sent leave message, ending call');
+          setTransientMessage('Собеседник завершил звонок.');
+          setCallStatus('ended');
+          teardownSession();
         },
         onMessage: (envelope) => {
           if (!isActive || !envelope?.type) {
@@ -1131,9 +1126,11 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   
   /** End the call and cleanup all resources */
   const hangup = useCallback(() => {
+    // Notify peer that we're intentionally leaving
+    sendSignal('leave', {});
     setCallStatus('ended');
     teardownSession();
-  }, [teardownSession]);
+  }, [sendSignal, teardownSession]);
 
   // Return state and actions for the UI
   return {
