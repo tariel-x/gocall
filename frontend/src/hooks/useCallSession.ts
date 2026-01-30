@@ -555,27 +555,38 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       resetPeerReconnection();
       pendingCandidatesRef.current = [];
       offerSentRef.current = false;
+
+      // Check current WebRTC state
+      const currentIceState = pcRef.current?.iceConnectionState;
+      const isConnected = currentIceState === 'connected' || currentIceState === 'completed';
+
+      // Если соединение уже работает — ничего не делаем (для обеих сторон)
+      if (isConnected) {
+        console.log('[CALL] Peer reconnected, WebRTC already connected, no action needed');
+        setTransientMessage(null);
+        return;
+      }
+
       setTransientMessage('Собеседник восстановил соединение.');
 
-      // Check current WebRTC state to decide recovery strategy
-      const currentIceState = pcRef.current?.iceConnectionState;
       const needsRecreate = !currentIceState || 
         currentIceState === 'failed' || 
-        currentIceState === 'closed' ||
-        currentIceState === 'disconnected';
+        currentIceState === 'closed';
 
-      // Хост инициирует восстановление, гость ожидает
+      // Только хост инициирует offer (чтобы избежать glare condition)
+      // Гость ожидает offer от хоста
       if (connectionParamsRef.current.role === 'host') {
         if (needsRecreate) {
           console.log('[CALL] Peer reconnected, WebRTC needs recreate, state:', currentIceState);
           void recreatePeerConnection({ fetchNewTurnConfig: true });
         } else {
-          console.log('[CALL] Peer reconnected, WebRTC still ok, doing ICE restart');
+          // disconnected state — попробуем ICE restart
+          console.log('[CALL] Peer reconnected, WebRTC disconnected, doing ICE restart');
           void performIceRestart();
         }
       } else if (!options?.fromJoin) {
-        // Гость ожидает новое предложение
-        setTransientMessage('Ожидаем новое предложение после переподключения...');
+        // Гость ожидает новое предложение от хоста
+        setTransientMessage('Ожидаем восстановление соединения...');
       }
     },
     [performIceRestart, recreatePeerConnection, resetPeerReconnection]
@@ -645,7 +656,14 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       setTransientMessage('Ответ получен. Устанавливаем соединение...');
     } catch (err) {
       console.error('[CALL] Failed to handle answer', err);
-      setError('Не удалось применить ответ собеседника. Попробуйте создать новую ссылку.');
+      // Don't show error if connection is already working (can happen during race conditions)
+      const currentIceState = pc.iceConnectionState;
+      if (currentIceState === 'connected' || currentIceState === 'completed') {
+        console.log('[CALL] Answer failed but connection is already working, ignoring');
+        setTransientMessage(null);
+      } else {
+        setError('Не удалось применить ответ собеседника. Попробуйте создать новую ссылку.');
+      }
     }
   }, [flushPendingCandidates]);
 
