@@ -154,6 +154,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const recreateAttemptsRef = useRef(0);                               // Counter for peer connection recreate attempts
   const isRecreatingRef = useRef(false);                               // Guard to prevent concurrent recreations
   const lastRtcConfigRef = useRef<RTCConfiguration>({});               // Cached RTC config for recreations
+  const setupPcHandlersRef = useRef<((pc: RTCPeerConnection) => void) | null>(null); // Ref to setup handlers function
   
   // ============================================================
   // SYNC EFFECTS
@@ -196,6 +197,18 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     if (peerDisconnectTimerRef.current) {
       clearTimeout(peerDisconnectTimerRef.current);
       peerDisconnectTimerRef.current = null;
+    }
+  }, []);
+
+  /** Clear all ICE-related timers */
+  const clearIceTimers = useCallback(() => {
+    if (iceRestartTimerRef.current) {
+      clearTimeout(iceRestartTimerRef.current);
+      iceRestartTimerRef.current = null;
+    }
+    if (iceRestartFallbackTimerRef.current) {
+      clearTimeout(iceRestartFallbackTimerRef.current);
+      iceRestartFallbackTimerRef.current = null;
     }
   }, []);
 
@@ -302,14 +315,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         signalingRef.current = null;
       }
     }
-    if (iceRestartTimerRef.current) {
-      clearTimeout(iceRestartTimerRef.current);
-      iceRestartTimerRef.current = null;
-    }
-    if (iceRestartFallbackTimerRef.current) {
-      clearTimeout(iceRestartFallbackTimerRef.current);
-      iceRestartFallbackTimerRef.current = null;
-    }
+    clearIceTimers();
     if (peerDisconnectTimerRef.current) {
       clearTimeout(peerDisconnectTimerRef.current);
       peerDisconnectTimerRef.current = null;
@@ -337,7 +343,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       setPeerDisconnected(false);
       resetMediaRoute();
     }
-  }, [resetMediaRoute]);
+  }, [clearIceTimers, resetMediaRoute]);
 
   // ============================================================
   // SIGNALING HELPERS
@@ -399,7 +405,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
    * 2. Optionally fetches fresh TURN credentials
    * 3. Creates a new RTCPeerConnection
    * 4. Re-adds local media tracks
-   * 5. Sets up event handlers
+   * 5. Sets up event handlers (using setupPcHandlersRef)
    * 6. Host initiates new offer, guest waits
    * 
    * @param options.fetchNewTurnConfig - if true, fetches fresh TURN credentials
@@ -423,16 +429,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     recreateAttemptsRef.current += 1;
     console.log(`[CALL] Recreating peer connection (attempt ${recreateAttemptsRef.current}/${maxAttempts})`);
 
-    // Clear any pending timers
-    if (iceRestartTimerRef.current) {
-      clearTimeout(iceRestartTimerRef.current);
-      iceRestartTimerRef.current = null;
-    }
-    if (iceRestartFallbackTimerRef.current) {
-      clearTimeout(iceRestartFallbackTimerRef.current);
-      iceRestartFallbackTimerRef.current = null;
-    }
-
+    clearIceTimers();
     setTransientMessage('Пересоздаём медиасоединение...');
     setReconnectionState('reconnecting');
     resetMediaRoute();
@@ -469,7 +466,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         }
       }
 
-      // Create new RTCPeerConnection
+      // Create new RTCPeerConnection and setup handlers
       const pc = new RTCPeerConnection(rtcConfig);
       pcRef.current = pc;
 
@@ -481,58 +478,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         });
       }
 
-      // Set up event handlers
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal('ice-candidate', event.candidate.toJSON());
-        }
-      };
-
-      pc.ontrack = (event) => {
-        const [stream] = event.streams;
-        if (stream) {
-          setRemoteStream(stream);
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        setPeerConnectionState(pc.connectionState ?? 'new');
-        if (pc.connectionState === 'connected') {
-          // Success! Reset attempt counter
-          recreateAttemptsRef.current = 0;
-          isRecreatingRef.current = false;
-          setReconnectionState('connected');
-        }
-        if (pc.connectionState === 'failed') {
-          // Will be handled by oniceconnectionstatechange
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        const state = pc.iceConnectionState ?? 'new';
-        setIceConnectionState(state);
-
-        if (state === 'connected' || state === 'completed') {
-          if (iceRestartTimerRef.current) {
-            clearTimeout(iceRestartTimerRef.current);
-            iceRestartTimerRef.current = null;
-          }
-          if (iceRestartFallbackTimerRef.current) {
-            clearTimeout(iceRestartFallbackTimerRef.current);
-            iceRestartFallbackTimerRef.current = null;
-          }
-          recreateAttemptsRef.current = 0;
-          isRecreatingRef.current = false;
-          setReconnectionState('connected');
-          void updateMediaRoute();
-        }
-
-        if (state === 'failed') {
-          // If recreation itself failed, try again with fresh TURN config
-          isRecreatingRef.current = false;
-          void recreatePeerConnection({ fetchNewTurnConfig: true });
-        }
-      };
+      // Setup handlers using ref (will be set up in init effect)
+      setupPcHandlersRef.current?.(pc);
 
       // Send renegotiate-request to peer so they know we're ready
       sendSignal('renegotiate-request', {});
@@ -554,7 +501,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       // Try again
       void recreatePeerConnection({ fetchNewTurnConfig: true });
     }
-  }, [resetMediaRoute, sendSignal, updateMediaRoute]);
+  }, [clearIceTimers, resetMediaRoute, sendSignal]);
 
   /**
    * Handles peer reconnection event (when the other participant reconnects).
@@ -865,105 +812,97 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       }
 
       // ----- STEP 5: Set up RTCPeerConnection event handlers -----
-      
-      // Send ICE candidates to remote peer via signaling
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal('ice-candidate', event.candidate.toJSON());
-        }
-      };
+      // Define the setup function and store in ref for reuse in recreatePeerConnection
+      const setupPcHandlers = (pc: RTCPeerConnection) => {
+        // Send ICE candidates to remote peer via signaling
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            sendSignal('ice-candidate', event.candidate.toJSON());
+          }
+        };
 
-      // Receive remote media tracks
-      pc.ontrack = (event) => {
-        if (!isActive) {
-          return;
-        }
-        const [stream] = event.streams;
-        if (stream) {
-          setRemoteStream(stream);
-        }
-      };
+        // Receive remote media tracks
+        pc.ontrack = (event) => {
+          if (!isActive) {
+            return;
+          }
+          const [stream] = event.streams;
+          if (stream) {
+            setRemoteStream(stream);
+          }
+        };
 
-      // Track overall peer connection state changes
-      pc.onconnectionstatechange = () => {
-        if (!isActive) {
-          return;
-        }
-        setPeerConnectionState(pc.connectionState ?? 'new');
-        // Don't show error immediately on 'failed' - let ICE restart/recreate handle it
-        // Error will be shown after max recreate attempts
-      };
+        // Track overall peer connection state changes
+        pc.onconnectionstatechange = () => {
+          if (!isActive) {
+            return;
+          }
+          setPeerConnectionState(pc.connectionState ?? 'new');
+          if (pc.connectionState === 'connected') {
+            recreateAttemptsRef.current = 0;
+            isRecreatingRef.current = false;
+            setReconnectionState('connected');
+          }
+          // Don't show error immediately on 'failed' - let ICE restart/recreate handle it
+        };
 
-      // Handle ICE connectivity state changes (for reconnection logic)
-      pc.oniceconnectionstatechange = () => {
-        if (!isActive) {
-          return;
-        }
-        const state = pc.iceConnectionState ?? 'new';
-        setIceConnectionState(state);
-        
-        // ICE connected: clear any pending restart timer, update media route
-        if (state === 'connected' || state === 'completed') {
-          if (iceRestartTimerRef.current) {
-            clearTimeout(iceRestartTimerRef.current);
-            iceRestartTimerRef.current = null;
+        // Handle ICE connectivity state changes (for reconnection logic)
+        pc.oniceconnectionstatechange = () => {
+          if (!isActive) {
+            return;
           }
-          if (iceRestartFallbackTimerRef.current) {
-            clearTimeout(iceRestartFallbackTimerRef.current);
-            iceRestartFallbackTimerRef.current = null;
-          }
-          recreateAttemptsRef.current = 0;
-          setReconnectionState('connected');
-          void updateMediaRoute();
-        }
-        
-        // ICE disconnected: wait 3s then attempt ICE restart, with fallback to full recreate
-        if (state === 'disconnected') {
-          if (iceRestartTimerRef.current) {
-            clearTimeout(iceRestartTimerRef.current);
-          }
-          if (iceRestartFallbackTimerRef.current) {
-            clearTimeout(iceRestartFallbackTimerRef.current);
-          }
-          setReconnectionState('reconnecting');
+          const state = pc.iceConnectionState ?? 'new';
+          setIceConnectionState(state);
           
-          // First try ICE restart after 3 seconds
-          iceRestartTimerRef.current = setTimeout(() => {
-            if (pcRef.current?.iceConnectionState === 'disconnected') {
-              void performIceRestart();
-              
-              // If ICE restart doesn't help within 5 more seconds, recreate the connection
-              iceRestartFallbackTimerRef.current = setTimeout(() => {
-                const currentState = pcRef.current?.iceConnectionState;
-                if (currentState && currentState !== 'connected' && currentState !== 'completed') {
-                  console.log('[CALL] ICE restart did not help, recreating peer connection');
-                  void recreatePeerConnection({ fetchNewTurnConfig: true });
-                }
-              }, 5000);
-            }
-          }, 3000);
-        }
-        
-        // ICE failed: immediately try to recreate the connection
-        if (state === 'failed') {
-          if (iceRestartTimerRef.current) {
-            clearTimeout(iceRestartTimerRef.current);
-            iceRestartTimerRef.current = null;
+          // ICE connected: clear any pending restart timer, update media route
+          if (state === 'connected' || state === 'completed') {
+            clearIceTimers();
+            recreateAttemptsRef.current = 0;
+            isRecreatingRef.current = false;
+            setReconnectionState('connected');
+            void updateMediaRoute();
           }
-          if (iceRestartFallbackTimerRef.current) {
-            clearTimeout(iceRestartFallbackTimerRef.current);
-            iceRestartFallbackTimerRef.current = null;
+          
+          // ICE disconnected: wait 3s then attempt ICE restart, with fallback to full recreate
+          if (state === 'disconnected') {
+            clearIceTimers();
+            setReconnectionState('reconnecting');
+            
+            // First try ICE restart after 3 seconds
+            iceRestartTimerRef.current = setTimeout(() => {
+              if (pcRef.current?.iceConnectionState === 'disconnected') {
+                void performIceRestart();
+                
+                // If ICE restart doesn't help within 5 more seconds, recreate the connection
+                iceRestartFallbackTimerRef.current = setTimeout(() => {
+                  const currentState = pcRef.current?.iceConnectionState;
+                  if (currentState && currentState !== 'connected' && currentState !== 'completed') {
+                    console.log('[CALL] ICE restart did not help, recreating peer connection');
+                    void recreatePeerConnection({ fetchNewTurnConfig: true });
+                  }
+                }, 5000);
+              }
+            }, 3000);
           }
-          resetMediaRoute();
-          setReconnectionState('reconnecting');
-          // ICE restart won't help if it already failed - recreate the connection
-          void recreatePeerConnection({ fetchNewTurnConfig: true });
-        }
-        
-        if (state === 'closed') {
-          resetMediaRoute();
-        }
+          
+          // ICE failed: immediately try to recreate the connection
+          if (state === 'failed') {
+            clearIceTimers();
+            resetMediaRoute();
+            setReconnectionState('reconnecting');
+            // ICE restart won't help if it already failed - recreate the connection
+            void recreatePeerConnection({ fetchNewTurnConfig: true });
+          }
+          
+          if (state === 'closed') {
+            resetMediaRoute();
+          }
+        };
       };
+
+      // Store for reuse and apply to current connection
+      setupPcHandlersRef.current = setupPcHandlers;
+      setupPcHandlers(pc);
 
       // ----- STEP 6: Subscribe to WebSocket signaling -----
       // This sets up handlers for all signaling messages from the server
@@ -1121,7 +1060,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       isActive = false;
       teardownSession({ preserveState: true });
     };
-  }, [callId, handlePeerReconnected, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, performIceRestart, recreatePeerConnection, resetMediaRoute, resetPeerReconnection, sendSignal, teardownSession, updateMediaRoute]);
+  }, [callId, clearIceTimers, handlePeerReconnected, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, performIceRestart, recreatePeerConnection, resetMediaRoute, resetPeerReconnection, sendSignal, teardownSession, updateMediaRoute]);
 
   // ============================================================
   // PUBLIC ACTIONS
