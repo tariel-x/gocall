@@ -149,7 +149,11 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);      // ICE candidates received before remote description set
   const offerSentRef = useRef(false);                                  // Guard to prevent duplicate offers
   const iceRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // Timer for delayed ICE restart
+  const iceRestartFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Timer for fallback to full recreate
   const peerDisconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // Timer for peer disconnect timeout (30s)
+  const recreateAttemptsRef = useRef(0);                               // Counter for peer connection recreate attempts
+  const isRecreatingRef = useRef(false);                               // Guard to prevent concurrent recreations
+  const lastRtcConfigRef = useRef<RTCConfiguration>({});               // Cached RTC config for recreations
   
   // ============================================================
   // SYNC EFFECTS
@@ -302,6 +306,10 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       clearTimeout(iceRestartTimerRef.current);
       iceRestartTimerRef.current = null;
     }
+    if (iceRestartFallbackTimerRef.current) {
+      clearTimeout(iceRestartFallbackTimerRef.current);
+      iceRestartFallbackTimerRef.current = null;
+    }
     if (peerDisconnectTimerRef.current) {
       clearTimeout(peerDisconnectTimerRef.current);
       peerDisconnectTimerRef.current = null;
@@ -316,8 +324,10 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     }
     pendingCandidatesRef.current = [];
     offerSentRef.current = false;
+    isRecreatingRef.current = false;
     releaseLocalStream();
     if (!options?.preserveState) {
+      recreateAttemptsRef.current = 0;
       setRemoteStream(null);
       setLocalStreamState(null);
       setPeerConnectionState('new');
@@ -381,10 +391,177 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   }, [sendSignal]);
 
   /**
+   * Completely recreates the RTCPeerConnection with fresh ICE candidates.
+   * Used when ICE restart fails (e.g., after network change where IP changed).
+   * 
+   * This function:
+   * 1. Closes the existing RTCPeerConnection
+   * 2. Optionally fetches fresh TURN credentials
+   * 3. Creates a new RTCPeerConnection
+   * 4. Re-adds local media tracks
+   * 5. Sets up event handlers
+   * 6. Host initiates new offer, guest waits
+   * 
+   * @param options.fetchNewTurnConfig - if true, fetches fresh TURN credentials
+   */
+  const recreatePeerConnection = useCallback(async (options?: { fetchNewTurnConfig?: boolean }) => {
+    // Guard against concurrent recreations
+    if (isRecreatingRef.current) {
+      console.log('[CALL] Recreation already in progress, skipping');
+      return;
+    }
+
+    const maxAttempts = 3;
+    if (recreateAttemptsRef.current >= maxAttempts) {
+      console.error('[CALL] Max recreate attempts reached');
+      setError('Не удалось восстановить соединение после нескольких попыток. Попробуйте создать новую ссылку.');
+      setReconnectionState('failed');
+      return;
+    }
+
+    isRecreatingRef.current = true;
+    recreateAttemptsRef.current += 1;
+    console.log(`[CALL] Recreating peer connection (attempt ${recreateAttemptsRef.current}/${maxAttempts})`);
+
+    // Clear any pending timers
+    if (iceRestartTimerRef.current) {
+      clearTimeout(iceRestartTimerRef.current);
+      iceRestartTimerRef.current = null;
+    }
+    if (iceRestartFallbackTimerRef.current) {
+      clearTimeout(iceRestartFallbackTimerRef.current);
+      iceRestartFallbackTimerRef.current = null;
+    }
+
+    setTransientMessage('Пересоздаём медиасоединение...');
+    setReconnectionState('reconnecting');
+    resetMediaRoute();
+
+    // Close existing peer connection
+    if (pcRef.current) {
+      pcRef.current.onicecandidate = null;
+      pcRef.current.ontrack = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.oniceconnectionstatechange = null;
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+
+    // Reset state for new connection
+    pendingCandidatesRef.current = [];
+    offerSentRef.current = false;
+    setRemoteStream(null);
+    setPeerConnectionState('new');
+    setIceConnectionState('new');
+
+    try {
+      // Optionally fetch fresh TURN config
+      let rtcConfig = lastRtcConfigRef.current;
+      if (options?.fetchNewTurnConfig) {
+        try {
+          const turnConfig = await fetchTurnConfig();
+          if (turnConfig?.iceServers?.length) {
+            rtcConfig = { iceServers: turnConfig.iceServers };
+            lastRtcConfigRef.current = rtcConfig;
+          }
+        } catch (err) {
+          console.warn('[CALL] Failed to fetch fresh TURN config, using cached', err);
+        }
+      }
+
+      // Create new RTCPeerConnection
+      const pc = new RTCPeerConnection(rtcConfig);
+      pcRef.current = pc;
+
+      // Re-add local tracks
+      const mediaStream = getLocalStream();
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => {
+          pc.addTrack(track, mediaStream);
+        });
+      }
+
+      // Set up event handlers
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          sendSignal('ice-candidate', event.candidate.toJSON());
+        }
+      };
+
+      pc.ontrack = (event) => {
+        const [stream] = event.streams;
+        if (stream) {
+          setRemoteStream(stream);
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        setPeerConnectionState(pc.connectionState ?? 'new');
+        if (pc.connectionState === 'connected') {
+          // Success! Reset attempt counter
+          recreateAttemptsRef.current = 0;
+          isRecreatingRef.current = false;
+          setReconnectionState('connected');
+        }
+        if (pc.connectionState === 'failed') {
+          // Will be handled by oniceconnectionstatechange
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState ?? 'new';
+        setIceConnectionState(state);
+
+        if (state === 'connected' || state === 'completed') {
+          if (iceRestartTimerRef.current) {
+            clearTimeout(iceRestartTimerRef.current);
+            iceRestartTimerRef.current = null;
+          }
+          if (iceRestartFallbackTimerRef.current) {
+            clearTimeout(iceRestartFallbackTimerRef.current);
+            iceRestartFallbackTimerRef.current = null;
+          }
+          recreateAttemptsRef.current = 0;
+          isRecreatingRef.current = false;
+          setReconnectionState('connected');
+          void updateMediaRoute();
+        }
+
+        if (state === 'failed') {
+          // If recreation itself failed, try again with fresh TURN config
+          isRecreatingRef.current = false;
+          void recreatePeerConnection({ fetchNewTurnConfig: true });
+        }
+      };
+
+      // Send renegotiate-request to peer so they know we're ready
+      sendSignal('renegotiate-request', {});
+
+      // Host creates offer, guest waits for offer
+      if (connectionParamsRef.current.role === 'host') {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        offerSentRef.current = true;
+        sendSignal('offer', offer);
+        setTransientMessage('Отправили новое предложение...');
+      } else {
+        setTransientMessage('Ожидаем предложение от собеседника...');
+        isRecreatingRef.current = false;
+      }
+    } catch (err) {
+      console.error('[CALL] Failed to recreate peer connection', err);
+      isRecreatingRef.current = false;
+      // Try again
+      void recreatePeerConnection({ fetchNewTurnConfig: true });
+    }
+  }, [resetMediaRoute, sendSignal, updateMediaRoute]);
+
+  /**
    * Handles peer reconnection event (when the other participant reconnects).
    * Resets state and initiates renegotiation:
-   * - Host: creates new offer (ICE restart)
-   * - Guest: waits for new offer from host
+   * - If WebRTC is still connected/completed: just do ICE restart
+   * - If WebRTC is disconnected/failed: recreate the connection
+   * - Host initiates, guest waits
    * 
    * @param options.fromJoin - true if called during initial join (skip waiting message for guest)
    */
@@ -395,15 +572,28 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       offerSentRef.current = false;
       setTransientMessage('Собеседник восстановил соединение.');
 
-      // Хост инициирует новое предложение / ICE restart, гость ожидает
+      // Check current WebRTC state to decide recovery strategy
+      const currentIceState = pcRef.current?.iceConnectionState;
+      const needsRecreate = !currentIceState || 
+        currentIceState === 'failed' || 
+        currentIceState === 'closed' ||
+        currentIceState === 'disconnected';
+
+      // Хост инициирует восстановление, гость ожидает
       if (connectionParamsRef.current.role === 'host') {
-        void performIceRestart();
+        if (needsRecreate) {
+          console.log('[CALL] Peer reconnected, WebRTC needs recreate, state:', currentIceState);
+          void recreatePeerConnection({ fetchNewTurnConfig: true });
+        } else {
+          console.log('[CALL] Peer reconnected, WebRTC still ok, doing ICE restart');
+          void performIceRestart();
+        }
       } else if (!options?.fromJoin) {
         // Гость ожидает новое предложение
         setTransientMessage('Ожидаем новое предложение после переподключения...');
       }
     },
-    [performIceRestart, resetPeerReconnection]
+    [performIceRestart, recreatePeerConnection, resetPeerReconnection]
   );
 
   // ============================================================
@@ -659,6 +849,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       } catch (err) {
         console.warn('[CALL] Failed to load TURN config', err);
       }
+      // Cache for potential recreation
+      lastRtcConfigRef.current = rtcConfig;
 
       // ----- STEP 3: Create RTCPeerConnection -----
       const pc = new RTCPeerConnection(rtcConfig);
@@ -698,9 +890,8 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           return;
         }
         setPeerConnectionState(pc.connectionState ?? 'new');
-        if (pc.connectionState === 'failed') {
-          setError('WebRTC соединение завершилось с ошибкой. Попробуйте перезапустить звонок.');
-        }
+        // Don't show error immediately on 'failed' - let ICE restart/recreate handle it
+        // Error will be shown after max recreate attempts
       };
 
       // Handle ICE connectivity state changes (for reconnection logic)
@@ -717,28 +908,56 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
             clearTimeout(iceRestartTimerRef.current);
             iceRestartTimerRef.current = null;
           }
+          if (iceRestartFallbackTimerRef.current) {
+            clearTimeout(iceRestartFallbackTimerRef.current);
+            iceRestartFallbackTimerRef.current = null;
+          }
+          recreateAttemptsRef.current = 0;
           setReconnectionState('connected');
           void updateMediaRoute();
         }
         
-        // ICE disconnected: wait 3s then attempt ICE restart
+        // ICE disconnected: wait 3s then attempt ICE restart, with fallback to full recreate
         if (state === 'disconnected') {
           if (iceRestartTimerRef.current) {
             clearTimeout(iceRestartTimerRef.current);
           }
+          if (iceRestartFallbackTimerRef.current) {
+            clearTimeout(iceRestartFallbackTimerRef.current);
+          }
           setReconnectionState('reconnecting');
+          
+          // First try ICE restart after 3 seconds
           iceRestartTimerRef.current = setTimeout(() => {
             if (pcRef.current?.iceConnectionState === 'disconnected') {
               void performIceRestart();
+              
+              // If ICE restart doesn't help within 5 more seconds, recreate the connection
+              iceRestartFallbackTimerRef.current = setTimeout(() => {
+                const currentState = pcRef.current?.iceConnectionState;
+                if (currentState && currentState !== 'connected' && currentState !== 'completed') {
+                  console.log('[CALL] ICE restart did not help, recreating peer connection');
+                  void recreatePeerConnection({ fetchNewTurnConfig: true });
+                }
+              }, 5000);
             }
           }, 3000);
         }
         
-        // ICE failed: immediate ICE restart attempt
+        // ICE failed: immediately try to recreate the connection
         if (state === 'failed') {
+          if (iceRestartTimerRef.current) {
+            clearTimeout(iceRestartTimerRef.current);
+            iceRestartTimerRef.current = null;
+          }
+          if (iceRestartFallbackTimerRef.current) {
+            clearTimeout(iceRestartFallbackTimerRef.current);
+            iceRestartFallbackTimerRef.current = null;
+          }
           resetMediaRoute();
           setReconnectionState('reconnecting');
-          void performIceRestart();
+          // ICE restart won't help if it already failed - recreate the connection
+          void recreatePeerConnection({ fetchNewTurnConfig: true });
         }
         
         if (state === 'closed') {
@@ -857,6 +1076,27 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           if (envelope.type === 'peer-reconnected') {
             handlePeerReconnected();
           }
+          // Handle renegotiation request from peer (they recreated their connection)
+          if (envelope.type === 'renegotiate-request') {
+            console.log('[CALL] Received renegotiate-request from peer');
+            // Reset offer state and prepare for new negotiation
+            pendingCandidatesRef.current = [];
+            offerSentRef.current = false;
+            
+            // Host creates new offer, guest just waits
+            if (connectionParamsRef.current.role === 'host') {
+              // Check if we need to recreate our connection too
+              const currentIceState = pcRef.current?.iceConnectionState;
+              if (!currentIceState || currentIceState === 'failed' || currentIceState === 'closed') {
+                void recreatePeerConnection({ fetchNewTurnConfig: false });
+              } else {
+                // Our connection is fine, just create new offer
+                void performIceRestart();
+              }
+            } else {
+              setTransientMessage('Собеседник пересоздаёт соединение, ожидаем...');
+            }
+          }
         },
         onClose: () => {
           if (!isActive) {
@@ -881,7 +1121,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       isActive = false;
       teardownSession({ preserveState: true });
     };
-  }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, resetPeerReconnection, sendSignal, teardownSession, updateMediaRoute]);
+  }, [callId, handlePeerReconnected, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, performIceRestart, recreatePeerConnection, resetMediaRoute, resetPeerReconnection, sendSignal, teardownSession, updateMediaRoute]);
 
   // ============================================================
   // PUBLIC ACTIONS
