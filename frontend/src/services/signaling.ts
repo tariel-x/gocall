@@ -134,30 +134,15 @@ const createSharedConnection = (callId: string, peerId?: string): SharedConnecti
     }
   };
 
-  const handleReconnectFailed = () => {
-    clearReconnectTimer(connection);
-    connection.callEnded = true;
-    dispatch((listener) => listener.onReconnectFailed?.());
-    dispatch((listener) => listener.onClose?.());
-    sharedConnections.delete(connection.key);
-    listeners.clear();
-  };
-
   const scheduleReconnect = () => {
     if (connection.callEnded) {
       return;
     }
 
     const attempt = connection.reconnectAttempts + 1;
-    const maxAttempts = 5;
     connection.reconnectAttempts = attempt;
 
-    if (attempt > maxAttempts) {
-      handleReconnectFailed();
-      return;
-    }
-
-    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+    const delay = 2000;
     clearReconnectTimer(connection);
     connection.reconnectTimer = setTimeout(() => {
       const newSocket = new WebSocket(buildWSUrl(connection.callId, connection.peerId));
