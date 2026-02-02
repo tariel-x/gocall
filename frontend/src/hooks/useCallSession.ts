@@ -1,45 +1,80 @@
+/**
+ * useCallSession Hook
+ * ====================
+ * 
+ * This hook encapsulates all WebRTC call logic for a video call session.
+ * It manages:
+ * - WebSocket signaling connection lifecycle
+ * - RTCPeerConnection setup and state
+ * - ICE candidate exchange and connectivity
+ * - Media stream acquisition and attachment
+ * - Reconnection handling (both WebSocket and WebRTC)
+ * - Peer disconnection detection and recovery
+ * 
+ * Architecture Overview:
+ * ----------------------
+ * 1. Session initialization (triggered by callId)
+ * 2. Local media acquisition (camera/microphone)
+ * 3. TURN server configuration fetch
+ * 4. RTCPeerConnection creation with ICE servers
+ * 5. WebSocket signaling subscription
+ * 6. SDP offer/answer exchange (host creates offer, guest answers)
+ * 7. ICE candidate trickle exchange
+ * 8. Connection established -> media flows
+ * 
+ * Reconnection Flow:
+ * ------------------
+ * - On ICE disconnected: wait 3s, then ICE restart (host-initiated)
+ * - On ICE failed: immediate ICE restart
+ * - On peer WebSocket disconnect: show warning, wait 30s for reconnect
+ * - On WebSocket reconnect: renegotiate WebRTC session
+ * 
+ * Role-based behavior:
+ * --------------------
+ * - Host: Creates SDP offer, initiates ICE restarts
+ * - Guest: Waits for offer, responds with answer
+ */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchTurnConfig } from '../services/api';
-import { acquireLocalMedia, getLocalStream, releaseLocalStream } from '../services/media';
 import { getSessionState, setCallContext, setPeerContext, SessionState } from '../services/session';
-import { CallStatus, PeerRole } from '../services/types';
+import { CallStatus, PeerRole, ReconnectionState } from '../services/types';
 import { SignalingClient, SignalingSubscription, subscribeToSignaling } from '../services/signaling';
 import type { WSState } from './useSignaling';
 import { MediaRouteMode } from './uiConsts';
+import { useLocalMedia } from './useLocalMedia';
+import { useLatest } from '../utils/useLatest';
+import { useWebRTCManager } from './useWebRTCManager';
 
-const describeCandidate = (candidate: any) => {
-  if (!candidate) {
-    return '';
-  }
-  const segments: string[] = [];
-  if (candidate.candidateType) {
-    segments.push(candidate.candidateType);
-  }
-  if (candidate.networkType) {
-    segments.push(candidate.networkType);
-  }
-  if (candidate.relayProtocol) {
-    segments.push(candidate.relayProtocol);
-  }
-  const host = candidate.address ?? candidate.ip;
-  if (host) {
-    segments.push(candidate.port ? `${host}:${candidate.port}` : host);
-  }
-  return segments.join(' · ');
-};
-
+/**
+ * Exported state from useCallSession hook.
+ * All reactive state that the UI needs to render the call page.
+ */
 export interface UseCallSessionState {
+  /** Current session metadata (callId, peerId, role) */
   sessionInfo: SessionState;
+  /** WebSocket signaling connection state */
   wsState: WSState;
+  /** High-level call status: waiting/active/ended */
   callStatus: CallStatus;
+  /** Number of participants in the call (1 or 2) */
   participants: number;
+  /** Error message to display, if any */
   error: string | null;
+  /** Remote peer's MediaStream (video/audio) */
   remoteStream: MediaStream | null;
-  localStreamState: MediaStream | null;
+  /** Local MediaStream (camera/mic) - from useLocalMedia hook */
+  localStream: MediaStream | null;
+  /** RTCPeerConnection state: new/connecting/connected/disconnected/failed/closed */
   peerConnectionState: RTCPeerConnectionState | 'new';
+  /** ICE connection state: new/checking/connected/completed/disconnected/failed/closed */
   iceConnectionState: RTCIceConnectionState | 'new';
+  /** Media route info: direct P2P or via TURN relay */
   mediaRoute: { mode: MediaRouteMode; detail?: string };
+  /** Temporary status message (cleared automatically when connection established) */
   transientMessage: string | null;
+  /** Reconnection state: connected/reconnecting/peer-disconnected/failed */
+  reconnectionState: ReconnectionState;
+  /** True when the remote peer has disconnected (WebSocket level) */
+  peerDisconnected: boolean;
 }
 
 export interface UseCallSessionActions {
@@ -53,37 +88,42 @@ export interface UseCallSessionResult {
 }
 
 export function useCallSession(callId: string | undefined): UseCallSessionResult {
+  // ============================================================
+  // LOCAL MEDIA
+  // Manage camera/microphone stream acquisition and cleanup
+  // ============================================================
+  const { stream: localStream, error: mediaError, initMedia } = useLocalMedia();
+
   const [sessionInfo, setSessionInfo] = useState<SessionState>(() => getSessionState());
-  const connectionParamsRef = useRef<{ peerId?: string; role: PeerRole }>({
-    peerId: sessionInfo.peerId,
-    role: sessionInfo.role ?? 'host',
-  });
+  const sessionInfoRef = useLatest(sessionInfo);
+
+  // ============================================================
+  // REACTIVE STATE
+  // These trigger re-renders and are exposed to the UI
+  // ============================================================
 
   const [wsState, setWsState] = useState<WSState>('connecting');
   const [callStatus, setCallStatus] = useState<CallStatus>('waiting');
   const [participants, setParticipants] = useState(1);
   const [error, setError] = useState<string | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
-  const [localStreamState, setLocalStreamState] = useState<MediaStream | null>(getLocalStream());
-  const [peerConnectionState, setPeerConnectionState] = useState<RTCPeerConnectionState | 'new'>('new');
-  const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState | 'new'>('new');
-  const [mediaRoute, setMediaRoute] = useState<{ mode: MediaRouteMode; detail?: string }>({ mode: 'unknown' });
   const [transientMessage, setTransientMessage] = useState<string | null>(null);
+  const [reconnectionState, setReconnectionState] = useState<ReconnectionState>('connected');
+  const [peerDisconnected, setPeerDisconnected] = useState(false);
 
-  const signalingRef = useRef<SignalingClient | null>(null);
-  const signalingSubscriptionRef = useRef<SignalingSubscription | null>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const offerSentRef = useRef(false);
+  // ============================================================
+  // REFS (mutable, non-reactive)
+  // Used for WebRTC objects and timers that shouldn't trigger renders
+  // ============================================================
+  const signalingRef = useRef<SignalingClient | null>(null);           // WebSocket client
+  const signalingSubscriptionRef = useRef<SignalingSubscription | null>(null); // Subscription handle
   
-  // Обновляем connectionParamsRef при изменении sessionInfo
-  useEffect(() => {
-    connectionParamsRef.current = {
-      peerId: sessionInfo.peerId,
-      role: sessionInfo.role ?? connectionParamsRef.current.role ?? 'host',
-    };
-  }, [sessionInfo.peerId, sessionInfo.role]);
+  // ============================================================
+  // SYNC EFFECTS
+  // Update session state when callId changes
+  // ============================================================
 
+  // When callId changes (from URL), update the session context.
+  // This persists the callId to sessionStorage for potential recovery.
   useEffect(() => {
     if (!callId) {
       return;
@@ -92,75 +132,70 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     setSessionInfo((prev) => ({ ...prev, callId }));
   }, [callId]);
 
-  const resetMediaRoute = useCallback(() => {
-    setMediaRoute({ mode: 'unknown' });
+  // ============================================================
+  // UTILITY CALLBACKS
+  // Small helper functions for state resets
+  // ============================================================
+  
+  /** Reset peer reconnection state */
+  const resetPeerReconnection = useCallback(() => {
+    setPeerDisconnected(false);
+    setReconnectionState('connected');
   }, []);
 
-  const updateMediaRoute = useCallback(async () => {
-    const pc = pcRef.current;
-    if (!pc) {
+  // ============================================================
+  // SIGNALING HELPERS
+  // Functions for sending messages via WebSocket
+  // ============================================================
+  
+  /** Send a signaling message via WebSocket (offer, answer, ice-candidate, etc.) */
+  const sendSignal = useCallback((type: string, data?: unknown) => {
+    if (!signalingRef.current) {
+      console.warn('[CALL] Signaling is not ready, unable to send', type);
       return;
     }
-    try {
-      const stats = await pc.getStats();
-      let selectedPair: any;
-      let selectedPairId: string | undefined;
-
-      stats.forEach((report: any) => {
-        if (!selectedPairId && report.type === 'transport' && report.selectedCandidatePairId) {
-          selectedPairId = report.selectedCandidatePairId as string;
-        }
-      });
-
-      if (selectedPairId) {
-        selectedPair = stats.get(selectedPairId);
-      }
-
-      if (!selectedPair) {
-        stats.forEach((report: any) => {
-          if (report.type === 'candidate-pair' && report.state === 'succeeded' && (report.nominated || report.selected)) {
-            if (!selectedPair) {
-              selectedPair = report;
-            }
-          }
-        });
-      }
-
-      if (!selectedPair) {
-        setMediaRoute({ mode: 'unknown' });
-        return;
-      }
-
-      const localCandidate = selectedPair.localCandidateId ? stats.get(selectedPair.localCandidateId) : undefined;
-      const remoteCandidate = selectedPair.remoteCandidateId ? stats.get(selectedPair.remoteCandidateId) : undefined;
-
-      const usesRelay =
-        (localCandidate && localCandidate.candidateType === 'relay') ||
-        (remoteCandidate && remoteCandidate.candidateType === 'relay');
-
-      const detailParts: string[] = [];
-      if (localCandidate) {
-        const summary = describeCandidate(localCandidate);
-        if (summary) {
-          detailParts.push(`локальный: ${summary}`);
-        }
-      }
-      if (remoteCandidate) {
-        const summary = describeCandidate(remoteCandidate);
-        if (summary) {
-          detailParts.push(`удалённый: ${summary}`);
-        }
-      }
-
-      setMediaRoute({
-        mode: usesRelay ? 'relay' : 'direct',
-        detail: detailParts.join(' | ') || undefined,
-      });
-    } catch (err) {
-      console.warn('[CALL] Failed to inspect media route', err);
-    }
+    signalingRef.current.send({ type, data });
   }, []);
 
+  // ============================================================
+  // WEBRTC MANAGER
+  // Manage RTCPeerConnection lifecycle and signaling handshake
+  // ============================================================
+
+  const {
+    pcRef,
+    processSignal,
+    initiateCall,
+    resetNegotiationState,
+    performIceRestart,
+    recreatePeerConnection,
+    connectionState: peerConnectionState,
+    iceConnectionState,
+    remoteStream,
+    mediaRoute,
+    destroyPeerConnection,
+  } = useWebRTCManager({
+    localStream,
+    isHost: sessionInfo.role === 'host',
+    isWsConnected: wsState === 'ready',
+    sendSignal,
+    onStatusMessage: setTransientMessage,
+    onError: setError,
+    onReconnectionState: setReconnectionState,
+  });
+
+  // ============================================================
+  // SESSION TEARDOWN
+  // Cleanup function for all WebRTC and signaling resources
+  // ============================================================
+  
+  /**
+   * Tears down the entire call session:
+   * - Unsubscribes from signaling WebSocket
+   * - Clears all pending timers
+   * - Destroys the RTCPeerConnection (owned by useWebRTCManager)
+   * - Optionally preserves state (for component unmount without full reset)
+   */
   const teardownSession = useCallback((options?: { preserveState?: boolean }) => {
     if (signalingSubscriptionRef.current) {
       signalingSubscriptionRef.current.unsubscribe();
@@ -174,270 +209,226 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
         signalingRef.current = null;
       }
     }
-    if (pcRef.current) {
-      pcRef.current.onicecandidate = null;
-      pcRef.current.ontrack = null;
-      pcRef.current.onconnectionstatechange = null;
-      pcRef.current.oniceconnectionstatechange = null;
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    pendingCandidatesRef.current = [];
-    offerSentRef.current = false;
-    releaseLocalStream();
+    // Note: releaseLocalStream is now handled by useLocalMedia hook cleanup
     if (!options?.preserveState) {
-      setRemoteStream(null);
-      setLocalStreamState(null);
-      setPeerConnectionState('new');
-      setIceConnectionState('new');
+      destroyPeerConnection();
       setWsState('disconnected');
-      resetMediaRoute();
+      setReconnectionState('connected');
+      setPeerDisconnected(false);
     }
-  }, [resetMediaRoute]);
+  }, [destroyPeerConnection]);
 
-  const sendSignal = useCallback((type: string, data?: unknown) => {
-    if (!signalingRef.current) {
-      console.warn('[CALL] Signaling is not ready, unable to send', type);
-      return;
-    }
-    signalingRef.current.send({ type, data });
-  }, []);
+  /**
+   * Handles peer reconnection event (when the other participant reconnects).
+   * Resets state and initiates renegotiation:
+   * - If WebRTC is still connected/completed: just do ICE restart
+   * - If WebRTC is disconnected/failed: recreate the connection
+   * - Host initiates, guest waits
+   * 
+   * @param options.fromJoin - true if called during initial join (skip waiting message for guest)
+   */
+  const handlePeerReconnected = useCallback(
+    (options?: { fromJoin?: boolean }) => {
+      resetPeerReconnection();
+      resetNegotiationState();
 
-  const flushPendingCandidates = useCallback(async () => {
-    const pc = pcRef.current;
-    if (!pc || !pc.remoteDescription) {
-      return;
-    }
-    while (pendingCandidatesRef.current.length > 0) {
-      const candidate = pendingCandidatesRef.current.shift();
-      if (!candidate) {
-        continue;
+      // Check current WebRTC state
+      const currentIceState = pcRef.current?.iceConnectionState;
+      const isConnected = currentIceState === 'connected' || currentIceState === 'completed';
+
+      // Если соединение уже работает — ничего не делаем (для обеих сторон)
+      if (isConnected) {
+        console.log('[CALL] Peer reconnected, WebRTC already connected, no action needed');
+        setTransientMessage(null);
+        return;
       }
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (err) {
-        console.warn('[CALL] Failed to add ICE candidate', err);
+
+      setTransientMessage('Собеседник восстановил соединение.');
+
+      // Только хост инициирует offer (чтобы избежать glare condition)
+      // Гость ожидает offer от хоста
+      if (sessionInfoRef.current.role === 'host') {
+        console.log('[CALL] Peer reconnected, recreating WebRTC connection, state:', currentIceState);
+        void recreatePeerConnection({ fetchNewTurnConfig: true });
+      } else if (!options?.fromJoin) {
+        // Гость ожидает новое предложение от хоста
+        setTransientMessage('Ожидаем восстановление соединения...');
       }
-    }
-  }, []);
+    },
+    [recreatePeerConnection, resetNegotiationState, resetPeerReconnection]
+  );
 
-  const handleRemoteOffer = useCallback(async (description: RTCSessionDescriptionInit) => {
-    const pc = pcRef.current;
-    if (!pc) {
-      return;
-    }
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(description));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      await flushPendingCandidates();
-      sendSignal('answer', answer);
-      setTransientMessage('Отправили ответ. Ждём подключение...');
-    } catch (err) {
-      console.error('[CALL] Failed to handle offer', err);
-      setError('Не удалось обработать предложение от собеседника. Перезагрузите страницу и попробуйте снова.');
-    }
-  }, [flushPendingCandidates, sendSignal]);
-
-  const handleRemoteAnswer = useCallback(async (description: RTCSessionDescriptionInit) => {
-    const pc = pcRef.current;
-    if (!pc) {
-      return;
-    }
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(description));
-      await flushPendingCandidates();
-      setTransientMessage('Ответ получен. Устанавливаем соединение...');
-    } catch (err) {
-      console.error('[CALL] Failed to handle answer', err);
-      setError('Не удалось применить ответ собеседника. Попробуйте перезапустить звонок.');
-    }
-  }, [flushPendingCandidates]);
-
-  const handleRemoteCandidate = useCallback(async (candidate: RTCIceCandidateInit) => {
-    const pc = pcRef.current;
-    if (!pc || !pc.remoteDescription) {
-      pendingCandidatesRef.current.push(candidate);
-      return;
-    }
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (err) {
-      console.warn('[CALL] Failed to apply remote ICE candidate', err);
-    }
-  }, []);
-
-  const createOfferRef = useRef<() => Promise<void>>();
-  createOfferRef.current = async () => {
-    const pc = pcRef.current;
-    if (!pc || offerSentRef.current) {
-      return;
-    }
-    try {
-      setTransientMessage('Формируем предложение...');
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      sendSignal('offer', offer);
-      offerSentRef.current = true;
-    } catch (err) {
-      console.error('[CALL] Failed to create offer', err);
-      setError('Не удалось создать предложение для звонка. Попробуйте перезагрузить страницу.');
-    }
-  };
-
-  // Auto-offer для host: проверяем условия после обновления participants и wsState
-  // Используем useEffect вместо setTimeout для надёжной реакции на изменения состояния
+  // ============================================================
+  // AUTO-OFFER EFFECT
+  // Automatically creates offer when conditions are met (host only)
+  // ============================================================
+  
+  /**
+   * Auto-offer for host: triggers offer creation when:
+   * 1. RTCPeerConnection is initialized
+   * 2. Current role is 'host'
+   * 3. Both participants are connected (participants >= 2)
+   * 4. WebSocket is ready
+   * 5. Offer hasn't been sent yet
+   * 
+   * Using useEffect ensures reliable reaction to state changes.
+   */
   useEffect(() => {
-    // Защита от преждевременного срабатывания: проверяем, что инициализация завершена
+    // Guard: ensure initialization is complete
     if (!pcRef.current) {
       return;
     }
     
-    // Проверяем условия для создания offer
-    if (connectionParamsRef.current.role !== 'host') {
+    // Only host creates offers
+    if (sessionInfoRef.current.role !== 'host') {
       return;
     }
+    // Need both participants and ready signaling
     if (participants < 2 || wsState !== 'ready') {
       return;
     }
-    if (offerSentRef.current) {
-      return;
-    }
-    
-    // Все условия выполнены - создаём offer
-    createOfferRef.current?.();
-  }, [participants, wsState]);
+    // All conditions met - create offer
+    void initiateCall();
+  }, [initiateCall, participants, wsState]);
 
-  // Очищаем transientMessage когда соединение установлено или появился remoteStream
-  // Это позволяет показать более актуальное сообщение вместо "Ответ получен..."
+  // ============================================================
+  // TRANSIENT MESSAGE CLEANUP
+  // Auto-clears status messages when connection is established
+  // ============================================================
+  
+  /**
+   * Clears transient status messages when the connection is fully established.
+   * This prevents stale messages like "Waiting for response..." from showing
+   * after the call is already working.
+   * 
+   * Clears when:
+   * - Call is active AND WebRTC connected AND ICE connected/completed
+   * - OR when remoteStream is received (media is flowing)
+   */
   useEffect(() => {
     if (!transientMessage) {
       return;
     }
     
-    // Очищаем если соединение полностью установлено
+    // Clear if connection is fully established
     const isConnected = 
       callStatus === 'active' &&
       peerConnectionState === 'connected' &&
       (iceConnectionState === 'connected' || iceConnectionState === 'completed');
     
-    // Или если появился remoteStream (это тоже признак работающего соединения)
+    // Also clear if remoteStream is received (media is flowing)
     if (isConnected || remoteStream) {
       setTransientMessage(null);
     }
   }, [transientMessage, callStatus, peerConnectionState, iceConnectionState, remoteStream]);
 
+  // ============================================================
+  // MAIN INITIALIZATION EFFECT
+  // Sets up the entire call session when callId is available
+  // ============================================================
+  
+  /**
+   * Main effect that initializes the call session.
+   * Runs when callId changes (typically once on mount).
+   * 
+   * Initialization sequence:
+   * 1. Validate callId and session state
+   * 2. Acquire local media (camera/microphone)
+   * 3. Fetch TURN server configuration
+   * 4. Create RTCPeerConnection with ICE servers
+   * 5. Add local tracks to peer connection
+   * 6. Set up RTCPeerConnection event handlers
+   * 7. Subscribe to signaling WebSocket
+   * 8. Process incoming signaling messages
+   * 
+   * Cleanup on unmount tears down the session (preserving state for potential recovery).
+   */
   useEffect(() => {
     if (!callId) {
       setError('Не указан идентификатор звонка. Вернитесь на главный экран.');
       return;
     }
 
-    // Защита от повторной инициализации: если сессия уже активна, не инициализируем заново
+    // Guard against re-initialization if session is already active
     if (pcRef.current || signalingRef.current) {
       return;
     }
 
-    const { peerId, role } = connectionParamsRef.current;
+    const { peerId, role } = sessionInfoRef.current;
     if (role === 'guest' && !peerId) {
       setError('Сессия гостя не найдена. Пройдите заново по приглашению.');
       return;
     }
 
+    // Flag to prevent state updates after unmount
     let isActive = true;
 
     const init = async () => {
+      // Reset state for fresh initialization
       setError(null);
       setTransientMessage(null);
       setCallStatus('waiting');
       setParticipants(1);
       setWsState('connecting');
 
-      let mediaStream: MediaStream | null = null;
+      // ----- STEP 1: Acquire local media (camera/microphone) -----
       try {
-        mediaStream = await acquireLocalMedia();
+        await initMedia();
         if (!isActive) {
           return;
         }
-        setLocalStreamState(mediaStream);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Не удалось получить доступ к устройствам.');
         return;
       }
 
-      let rtcConfig: RTCConfiguration = {};
-      try {
-        const turnConfig = await fetchTurnConfig();
-        if (!isActive) {
-          return;
-        }
-        if (turnConfig?.iceServers?.length) {
-          rtcConfig = { iceServers: turnConfig.iceServers };
-        }
-      } catch (err) {
-        console.warn('[CALL] Failed to load TURN config', err);
+      // Check if media acquisition was successful via the hook state
+      if (mediaError) {
+        setError(mediaError);
+        return;
       }
 
-      const pc = new RTCPeerConnection(rtcConfig);
-      pcRef.current = pc;
-
-      if (mediaStream) {
-        const streamForTracks = mediaStream;
-        streamForTracks.getTracks().forEach((track) => {
-          pc.addTrack(track, streamForTracks);
-        });
+      // ----- STEP 2: Wait for RTCPeerConnection to be initialized by useWebRTCManager -----
+      // The manager hook initializes the PC asynchronously, so we may need to wait a bit
+      // or ensure the PC is ready before attaching handlers
+      const maxWaitTime = 5000;
+      const startTime = Date.now();
+      while (!pcRef.current && Date.now() - startTime < maxWaitTime) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (!isActive) {
+          return;
+        }
       }
 
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal('ice-candidate', event.candidate.toJSON());
-        }
-      };
+      const pc = pcRef.current;
+      if (!pc) {
+        setError('Не удалось инициализировать WebRTC соединение. Попробуйте перезагрузить страницу.');
+        return;
+      }
 
-      pc.ontrack = (event) => {
-        if (!isActive) {
-          return;
-        }
-        const [stream] = event.streams;
-        if (stream) {
-          setRemoteStream(stream);
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (!isActive) {
-          return;
-        }
-        setPeerConnectionState(pc.connectionState ?? 'new');
-        if (pc.connectionState === 'failed') {
-          setError('WebRTC соединение завершилось с ошибкой. Попробуйте перезапустить звонок.');
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        if (!isActive) {
-          return;
-        }
-        const state = pc.iceConnectionState ?? 'new';
-        setIceConnectionState(state);
-        if (state === 'connected' || state === 'completed') {
-          void updateMediaRoute();
-        }
-        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
-          resetMediaRoute();
-        }
-      };
-
+      // ----- STEP 4: Subscribe to WebSocket signaling -----
+      // This sets up handlers for all signaling messages from the server
       const subscription = subscribeToSignaling(callId, peerId, {
+        // Called when successfully joined the call room
         onJoin: (data) => {
           if (!isActive) {
             return;
           }
           setWsState('ready');
           if (data?.peer_id) {
-            const resolvedRole = (data.role as PeerRole) ?? connectionParamsRef.current.role ?? 'host';
+            const resolvedRole = (data.role as PeerRole) ?? sessionInfoRef.current.role ?? 'host';
             setPeerContext(data.peer_id, resolvedRole);
             setSessionInfo((prev) => ({ ...prev, peerId: data.peer_id, role: resolvedRole }));
+          }
+          const isReconnect = (data as any)?.is_reconnect === true;
+          const peerOnline = (data as any)?.peer_online === true;
+          if (isReconnect) {
+            setReconnectionState('reconnecting');
+            setTransientMessage('Восстанавливаем соединение...');
+            handlePeerReconnected({ fromJoin: true });
+          }
+          if (peerOnline) {
+            resetPeerReconnection();
           }
           // Проверка условий для auto-offer выполнится автоматически через useEffect
           // при обновлении wsState
@@ -455,13 +446,19 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           // Проверка условий для auto-offer выполнится автоматически через useEffect
           // при обновлении participants
         },
+        onReconnected: () => {
+          if (!isActive) {
+            return;
+          }
+          handlePeerReconnected();
+        },
         onOffer: (message) => {
-          if (!isActive || connectionParamsRef.current.role === 'host') {
+          if (!isActive || sessionInfoRef.current.role === 'host') {
             return;
           }
           const description = message.data as RTCSessionDescriptionInit | undefined;
           if (description) {
-            handleRemoteOffer(description);
+            void processSignal('offer', description);
           }
         },
         onAnswer: (message) => {
@@ -470,7 +467,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           }
           const description = message.data as RTCSessionDescriptionInit | undefined;
           if (description) {
-            handleRemoteAnswer(description);
+            void processSignal('answer', description);
           }
         },
         onIceCandidate: (message) => {
@@ -479,15 +476,51 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
           }
           const candidate = message.data as RTCIceCandidateInit | undefined;
           if (candidate) {
-            handleRemoteCandidate(candidate);
+            void processSignal('ice-candidate', candidate);
           }
         },
         onLeave: () => {
           if (!isActive) {
             return;
           }
+          // Intentional leave from peer - end call immediately
+          console.log('[CALL] Peer sent leave message, ending call');
+          setTransientMessage('Собеседник завершил звонок.');
           setCallStatus('ended');
           teardownSession();
+        },
+        onMessage: (envelope) => {
+          if (!isActive || !envelope?.type) {
+            return;
+          }
+          if (envelope.type === 'peer-disconnected') {
+            setPeerDisconnected(true);
+            setReconnectionState('peer-disconnected');
+            setTransientMessage('Собеседник отключился. Ждём переподключения...');
+          }
+          if (envelope.type === 'peer-reconnected') {
+            handlePeerReconnected();
+          }
+          // Handle renegotiation request from peer (they recreated their connection)
+          if (envelope.type === 'renegotiate-request') {
+            console.log('[CALL] Received renegotiate-request from peer');
+            // Reset offer state and prepare for new negotiation
+            resetNegotiationState();
+            
+            // Host creates new offer, guest just waits
+            if (sessionInfoRef.current.role === 'host') {
+              // Check if we need to recreate our connection too
+              const currentIceState = pcRef.current?.iceConnectionState;
+              if (!currentIceState || currentIceState === 'failed' || currentIceState === 'closed') {
+                void recreatePeerConnection({ fetchNewTurnConfig: false });
+              } else {
+                // Our connection is fine, just create new offer
+                void performIceRestart();
+              }
+            } else {
+              setTransientMessage('Собеседник пересоздаёт соединение, ожидаем...');
+            }
+          }
         },
         onClose: () => {
           if (!isActive) {
@@ -512,13 +545,22 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       isActive = false;
       teardownSession({ preserveState: true });
     };
-  }, [callId, handleRemoteAnswer, handleRemoteCandidate, handleRemoteOffer, resetMediaRoute, sendSignal, teardownSession, updateMediaRoute]);
+  }, [callId, handlePeerReconnected, initMedia, mediaError, performIceRestart, processSignal, recreatePeerConnection, resetNegotiationState, resetPeerReconnection, sendSignal, teardownSession]);
 
+  // ============================================================
+  // PUBLIC ACTIONS
+  // Actions exposed to the UI for user interactions
+  // ============================================================
+  
+  /** End the call and cleanup all resources */
   const hangup = useCallback(() => {
+    // Notify peer that we're intentionally leaving
+    sendSignal('leave', {});
     setCallStatus('ended');
     teardownSession();
-  }, [teardownSession]);
+  }, [sendSignal, teardownSession]);
 
+  // Return state and actions for the UI
   return {
     state: {
       sessionInfo,
@@ -527,11 +569,13 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
       participants,
       error,
       remoteStream,
-      localStreamState,
+      localStream,
       peerConnectionState,
       iceConnectionState,
       mediaRoute,
       transientMessage,
+      reconnectionState,
+      peerDisconnected,
     },
     actions: {
       setTransientMessage,

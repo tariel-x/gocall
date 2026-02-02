@@ -3,6 +3,7 @@ export interface TurnConfig {
 }
 
 export type CallStatus = 'waiting' | 'active' | 'ended';
+export type ReconnectionState = 'connected' | 'reconnecting' | 'peer-disconnected' | 'failed';
 
 export interface CallResponse {
   call_id: string;

@@ -1,7 +1,7 @@
 FRONTEND_DIR := frontend
 DIST_DIR := internal/static/dist
 
-.PHONY: install frontend-clean frontend server all clean
+.PHONY: install frontend-clean frontend server server-linux-x64 all clean
 
 install:
 	cd $(FRONTEND_DIR) && npm install
@@ -21,3 +21,7 @@ all: frontend-clean frontend server
 
 clean: frontend-clean
 	rm -f gocall
+
+.PHONY: docker-build
+docker-build:
+	docker buildx build --platform linux/amd64 -t gocall:latest .

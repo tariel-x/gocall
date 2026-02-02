@@ -23,6 +23,9 @@ export interface SignalingEnvelope {
 
 export interface SignalingCallbacks {
   onOpen?: () => void;
+  onReconnecting?: () => void;
+  onReconnected?: () => void;
+  onReconnectFailed?: () => void;
   onJoin?: (data: JoinEnvelope) => void;
   onState?: (data: StateEnvelope) => void;
   onOffer?: (message: SignalingEnvelope) => void;
@@ -47,6 +50,9 @@ interface SharedConnection {
   listeners: Set<SignalingCallbacks>;
   pendingQueue: SignalingEnvelope[];
   idleTimer: ReturnType<typeof setTimeout> | null;
+  reconnectAttempts: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  callEnded: boolean;
   client: SignalingClient;
   ready: boolean;
   lastJoin?: JoinEnvelope;
@@ -77,9 +83,15 @@ const scheduleIdleClose = (connection: SharedConnection) => {
   }, 3000);
 };
 
+const clearReconnectTimer = (connection: SharedConnection) => {
+  if (connection.reconnectTimer) {
+    clearTimeout(connection.reconnectTimer);
+    connection.reconnectTimer = null;
+  }
+};
+
 const createSharedConnection = (callId: string, peerId?: string): SharedConnection => {
   const wsURL = buildWSUrl(callId, peerId);
-  const socket = new WebSocket(wsURL);
   const listeners = new Set<SignalingCallbacks>();
   const pendingQueue: SignalingEnvelope[] = [];
 
@@ -87,10 +99,13 @@ const createSharedConnection = (callId: string, peerId?: string): SharedConnecti
     key: connectionKey(callId),
     callId,
     peerId,
-    socket,
+    socket: new WebSocket(wsURL),
     listeners,
     pendingQueue,
     idleTimer: null,
+    reconnectAttempts: 0,
+    reconnectTimer: null,
+    callEnded: false,
     client: {
       send: () => undefined,
       close: () => undefined,
@@ -100,8 +115,14 @@ const createSharedConnection = (callId: string, peerId?: string): SharedConnecti
     lastState: undefined,
   };
 
+  const dispatch = (fn: (cb: SignalingCallbacks) => void) => {
+    listeners.forEach((listener) => {
+      fn(listener);
+    });
+  };
+
   const flushQueue = () => {
-    if (socket.readyState !== WebSocket.OPEN || pendingQueue.length === 0) {
+    if (connection.socket.readyState !== WebSocket.OPEN || pendingQueue.length === 0) {
       return;
     }
     while (pendingQueue.length > 0) {
@@ -109,98 +130,131 @@ const createSharedConnection = (callId: string, peerId?: string): SharedConnecti
       if (!next) {
         continue;
       }
-      socket.send(JSON.stringify(next));
+      connection.socket.send(JSON.stringify(next));
     }
   };
 
-  const dispatch = (fn: (cb: SignalingCallbacks) => void) => {
-    listeners.forEach((listener) => {
-      fn(listener);
-    });
+  const scheduleReconnect = () => {
+    if (connection.callEnded) {
+      return;
+    }
+
+    const attempt = connection.reconnectAttempts + 1;
+    connection.reconnectAttempts = attempt;
+
+    const delay = 2000;
+    clearReconnectTimer(connection);
+    connection.reconnectTimer = setTimeout(() => {
+      const newSocket = new WebSocket(buildWSUrl(connection.callId, connection.peerId));
+      attachSocketHandlers(newSocket);
+    }, delay);
   };
 
-  socket.onopen = () => {
-    connection.ready = true;
-    flushQueue();
-    dispatch((listener) => listener.onOpen?.());
-  };
+  function attachSocketHandlers(socket: WebSocket) {
+    connection.socket = socket;
 
-  socket.onmessage = (event) => {
-    try {
-      const envelope: SignalingEnvelope = JSON.parse(event.data);
-      if (!envelope?.type) {
+    socket.onopen = () => {
+      const wasReconnecting = connection.reconnectAttempts > 0;
+      connection.ready = true;
+      connection.reconnectAttempts = 0;
+      clearReconnectTimer(connection);
+      flushQueue();
+      dispatch((listener) => listener.onOpen?.());
+      if (wasReconnecting) {
+        dispatch((listener) => listener.onReconnected?.());
+      }
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const envelope: SignalingEnvelope = JSON.parse(event.data);
+        if (!envelope?.type) {
+          return;
+        }
+        switch (envelope.type) {
+          case 'join':
+            if (envelope.data) {
+              const joinData = envelope.data as JoinEnvelope;
+              connection.lastJoin = joinData;
+              if (!connection.peerId && joinData?.peer_id) {
+                connection.peerId = joinData.peer_id;
+              }
+              dispatch((listener) => listener.onJoin?.(joinData));
+            }
+            break;
+          case 'state':
+            if (envelope.data) {
+              const stateData = envelope.data as StateEnvelope;
+              connection.lastState = stateData;
+              dispatch((listener) => listener.onState?.(stateData));
+            }
+            break;
+          case 'offer':
+            dispatch((listener) => listener.onOffer?.(envelope));
+            break;
+          case 'answer':
+            dispatch((listener) => listener.onAnswer?.(envelope));
+            break;
+          case 'ice-candidate':
+            dispatch((listener) => listener.onIceCandidate?.(envelope));
+            break;
+          case 'leave':
+            dispatch((listener) => listener.onLeave?.(envelope));
+            break;
+          case 'ping':
+            break;
+          default:
+            dispatch((listener) => listener.onMessage?.(envelope));
+        }
+      } catch (err) {
+        console.warn('Failed to parse signaling message', err);
+      }
+    };
+
+    socket.onclose = (event) => {
+      connection.ready = false;
+
+      const normalClosure = event.code === 1000 || event.code === 1001;
+      if (connection.callEnded || normalClosure) {
+        pendingQueue.length = 0;
+        clearReconnectTimer(connection);
+        dispatch((listener) => listener.onClose?.());
+        sharedConnections.delete(connection.key);
+        listeners.clear();
         return;
       }
-      switch (envelope.type) {
-        case 'join':
-          if (envelope.data) {
-            const joinData = envelope.data as JoinEnvelope;
-            connection.lastJoin = joinData;
-            if (!connection.peerId && joinData?.peer_id) {
-              connection.peerId = joinData.peer_id;
-            }
-            dispatch((listener) => listener.onJoin?.(joinData));
-          }
-          break;
-        case 'state':
-          if (envelope.data) {
-            const stateData = envelope.data as StateEnvelope;
-            connection.lastState = stateData;
-            dispatch((listener) => listener.onState?.(stateData));
-          }
-          break;
-        case 'offer':
-          dispatch((listener) => listener.onOffer?.(envelope));
-          break;
-        case 'answer':
-          dispatch((listener) => listener.onAnswer?.(envelope));
-          break;
-        case 'ice-candidate':
-          dispatch((listener) => listener.onIceCandidate?.(envelope));
-          break;
-        case 'leave':
-          dispatch((listener) => listener.onLeave?.(envelope));
-          break;
-        case 'ping':
-          break;
-        default:
-          dispatch((listener) => listener.onMessage?.(envelope));
-      }
-    } catch (err) {
-      console.warn('Failed to parse signaling message', err);
-    }
-  };
 
-  socket.onclose = () => {
-    connection.ready = false;
-    pendingQueue.length = 0;
-    dispatch((listener) => listener.onClose?.());
-    sharedConnections.delete(connectionKey(callId));
-    listeners.clear();
-  };
+      dispatch((listener) => listener.onReconnecting?.());
+      scheduleReconnect();
+    };
 
-  socket.onerror = (event) => {
-    dispatch((listener) => listener.onError?.(event));
-  };
+    socket.onerror = (event) => {
+      dispatch((listener) => listener.onError?.(event));
+    };
+  }
 
   const send = (message: SignalingEnvelope) => {
     if (!message?.type) {
       return;
     }
+    const socket = connection.socket;
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
       return;
     }
-    if (socket.readyState === WebSocket.CONNECTING) {
+    if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
       pendingQueue.push(message);
     }
   };
 
   const close = () => {
+    connection.callEnded = true;
     cancelIdleTimer(connection);
+    clearReconnectTimer(connection);
     listeners.clear();
     pendingQueue.length = 0;
     sharedConnections.delete(connection.key);
+    const socket = connection.socket;
     if (socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
       return;
     }
@@ -208,6 +262,8 @@ const createSharedConnection = (callId: string, peerId?: string): SharedConnecti
   };
 
   connection.client = { send, close };
+
+  attachSocketHandlers(connection.socket);
 
   return connection;
 };

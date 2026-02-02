@@ -97,6 +97,8 @@ const JoinPage = () => {
     }
   };
 
+  const wsBadgeClass = wsState === 'reconnecting' ? 'status-badge status-connecting' : `status-badge status-${wsState}`;
+
   if (!callId) {
     return (
       <main className="page">
@@ -140,8 +142,9 @@ const JoinPage = () => {
         <div className="status-row">
           <span className="status-label">Сигналинг:</span>
           {sessionState.peerId ? (
-            <span className={`status-badge status-${wsState}`}>
+            <span className={wsBadgeClass}>
               {wsState === 'connecting' && 'Подключаемся...'}
+              {wsState === 'reconnecting' && 'Переподключаемся...'}
               {wsState === 'ready' && 'Соединение установлено'}
               {wsState === 'disconnected' && 'Разъединено'}
             </span>

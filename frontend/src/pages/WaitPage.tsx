@@ -96,6 +96,8 @@ const WaitPage = () => {
     );
   }
 
+  const wsBadgeClass = wsState === 'reconnecting' ? 'status-badge status-connecting' : `status-badge status-${wsState}`;
+
   return (
     <main className="page wait-page">
       <h1>Ожидание подключения</h1>
@@ -115,8 +117,9 @@ const WaitPage = () => {
         </div>
         <div className="status-row">
           <span className="status-label">Сигналинг:</span>
-          <span className={`status-badge status-${wsState}`}>
+          <span className={wsBadgeClass}>
             {wsState === 'connecting' && 'Подключаемся...'}
+            {wsState === 'reconnecting' && 'Переподключаемся...'}
             {wsState === 'ready' && 'Соединение установлено'}
             {wsState === 'disconnected' && 'Разъединено'}
           </span>

@@ -13,10 +13,12 @@ const (
 )
 
 type CallParticipantV2 struct {
-	PeerID    string    `json:"peer_id"`
-	JoinedAt  time.Time `json:"joined_at"`
-	LeftAt    time.Time `json:"left_at,omitempty"`
-	IsPresent bool      `json:"is_present"`
+	PeerID         string    `json:"peer_id"`
+	JoinedAt       time.Time `json:"joined_at"`
+	LeftAt         time.Time `json:"left_at,omitempty"`
+	IsPresent      bool      `json:"is_present"`
+	DisconnectedAt time.Time `json:"disconnected_at,omitempty"`
+	ReconnectCount int       `json:"reconnect_count,omitempty"`
 }
 
 type CallV2 struct {
