@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import { subscribeToSignaling, SignalingSubscription } from '../services/signaling';
 import { setPeerContext } from '../services/session';
 import { CallStatus, PeerRole } from '../services/types';
@@ -13,7 +13,35 @@ interface SignalingOptions {
   onState?: (status: CallStatus, participants: number) => void;
 }
 
-export const useSignaling = ({
+export function useSignaling(callId: string, peerId?: string) {
+  const [isReady, setIsReady] = useState(false);
+  const socketRef = useRef<SignalingSubscription | null>(null);
+
+  const messageQueue = useRef<any[]>([]);
+
+  const handlers = useRef({
+    onOffer: (data: any) => {},
+    onAnswer: (data: any) => {},
+    onCandidate: (data: any) => {},
+    onPeerLeft: () => {},
+    onPeerJoined: () => {}
+  });
+
+  const setHandlers = useCallback((newHandlers: Partial<typeof handlers.current>) => {
+    handlers.current = { ...handlers.current, ...newHandlers };
+  }, []);
+
+  const send = useCallback((type: string, payload: any) => {
+    if (socketRef.current && isReady) {
+      socketRef.current.client.send({ type, data: payload });
+    } else {
+      console.log('Socket not ready, queuing', type);
+      messageQueue.current.push({ type, data: payload });
+    }
+  }, [isReady]);
+}
+
+export const useSignaling1 = ({
   callId,
   peerId,
   enabled = true,
