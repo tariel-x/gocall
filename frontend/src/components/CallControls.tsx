@@ -1,5 +1,5 @@
 import React, { forwardRef } from 'react';
-import { UseCallSessionState } from '../hooks/useCallSession';
+import { CallStatus } from '../services/types';
 
 interface CallControlsProps {
   onHangup: () => void;
@@ -7,7 +7,7 @@ interface CallControlsProps {
   infoMessage: string | null;
   reconnectionLabel: string | null;
   error: string | null;
-  callStatus: UseCallSessionState['callStatus'];
+  callStatus: CallStatus;
   showStatusPanel: boolean;
 }
 

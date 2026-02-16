@@ -18,7 +18,7 @@ const JoinPage = () => {
   const [isCallLoaded, setIsCallLoaded] = useState(false);
 
   const { mediaState, mediaError, requestMedia } = useMediaPermissions();
-  const { wsState } = useSignaling({
+  const { isReady } = useSignaling({
     callId,
     peerId: sessionState.peerId,
     enabled: Boolean(sessionState.peerId),
@@ -97,7 +97,7 @@ const JoinPage = () => {
     }
   };
 
-  const wsBadgeClass = wsState === 'reconnecting' ? 'status-badge status-connecting' : `status-badge status-${wsState}`;
+  const signalingBadgeClass = isReady ? 'status-badge status-ready' : 'status-badge status-connecting';
 
   if (!callId) {
     return (
@@ -142,11 +142,8 @@ const JoinPage = () => {
         <div className="status-row">
           <span className="status-label">Сигналинг:</span>
           {sessionState.peerId ? (
-            <span className={wsBadgeClass}>
-              {wsState === 'connecting' && 'Подключаемся...'}
-              {wsState === 'reconnecting' && 'Переподключаемся...'}
-              {wsState === 'ready' && 'Соединение установлено'}
-              {wsState === 'disconnected' && 'Разъединено'}
+            <span className={signalingBadgeClass}>
+              {isReady ? 'Соединение установлено' : 'Подключаемся...'}
             </span>
           ) : (
             <span className="status-badge status-waiting">Подключится после входа</span>

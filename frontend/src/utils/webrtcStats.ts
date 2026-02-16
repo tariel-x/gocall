@@ -1,4 +1,4 @@
-import { MediaRouteMode } from '../hooks/uiConsts';
+import { MediaRouteMode } from '../services/types';
 
 interface MediaRouteInfo {
   mode: MediaRouteMode;

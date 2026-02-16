@@ -13,8 +13,13 @@ const CallPage = () => {
   const [showStatusPanel, setShowStatusPanel] = useState(false);
   const toggleButtonRef = useRef<HTMLButtonElement>(null);
 
-  const { state, actions } = useCallSession(callId);
-  const { callStatus, participants, error, remoteStream, localStream } = state;
+  const {
+    localStream,
+    remoteStream,
+    hangup,
+    details,
+  } = useCallSession(callId);
+  const { callStatus, participants, error } = details;
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -23,10 +28,10 @@ const CallPage = () => {
   useVideoElement(localVideoRef, localStream, { muted: true, playsInline: true });
   useVideoElement(remoteVideoRef, remoteStream, { playsInline: true });
 
-  const { infoMessage, reconnectionLabel } = useCallStatusMessage(state);
+  const { infoMessage, reconnectionLabel } = useCallStatusMessage(details);
 
   const handleHangup = () => {
-    actions.hangup();
+    hangup();
     resetSession();
     navigate('/');
   };
@@ -50,7 +55,7 @@ const CallPage = () => {
         <CallStatusPanel
           isOpen={showStatusPanel}
           onClose={() => setShowStatusPanel(false)}
-          state={state}
+          details={details}
           reconnectionLabel={reconnectionLabel}
           toggleButtonRef={toggleButtonRef}
         />

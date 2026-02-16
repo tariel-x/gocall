@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { UseCallSessionState } from '../hooks/useCallSession';
+import { CallSessionDetails } from '../services/types';
 import {
   getPeerStateMeta,
   getIceStateMeta,
@@ -8,12 +8,12 @@ import {
   CALL_STATUS_TEXT,
   WS_STATE_META,
   MEDIA_ROUTE_META,
-} from '../hooks/uiConsts';
+} from '../utils/callStatusUtils';
 
 interface CallStatusPanelProps {
   isOpen: boolean;
   onClose: () => void;
-  state: UseCallSessionState;
+  details: CallSessionDetails;
   reconnectionLabel: string | null;
   toggleButtonRef?: React.RefObject<HTMLElement>;
 }
@@ -21,7 +21,7 @@ interface CallStatusPanelProps {
 export const CallStatusPanel: React.FC<CallStatusPanelProps> = ({
   isOpen,
   onClose,
-  state,
+  details,
   reconnectionLabel,
   toggleButtonRef,
 }) => {
@@ -33,7 +33,7 @@ export const CallStatusPanel: React.FC<CallStatusPanelProps> = ({
     peerConnectionState,
     iceConnectionState,
     mediaRoute,
-  } = state;
+  } = details;
 
   useEffect(() => {
     if (!isOpen) {

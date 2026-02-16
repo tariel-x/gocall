@@ -16,7 +16,7 @@ const WaitPage = () => {
   const [callError, setCallError] = useState<string | null>(null);
 
   const { mediaState, mediaError, requestMedia } = useMediaPermissions();
-  const { wsState } = useSignaling({
+  const { isReady } = useSignaling({
     callId,
     onState: (status, count) => {
       setCallStatus(status);
@@ -96,7 +96,7 @@ const WaitPage = () => {
     );
   }
 
-  const wsBadgeClass = wsState === 'reconnecting' ? 'status-badge status-connecting' : `status-badge status-${wsState}`;
+  const signalingBadgeClass = isReady ? 'status-badge status-ready' : 'status-badge status-connecting';
 
   return (
     <main className="page wait-page">
@@ -117,11 +117,8 @@ const WaitPage = () => {
         </div>
         <div className="status-row">
           <span className="status-label">Сигналинг:</span>
-          <span className={wsBadgeClass}>
-            {wsState === 'connecting' && 'Подключаемся...'}
-            {wsState === 'reconnecting' && 'Переподключаемся...'}
-            {wsState === 'ready' && 'Соединение установлено'}
-            {wsState === 'disconnected' && 'Разъединено'}
+          <span className={signalingBadgeClass}>
+            {isReady ? 'Соединение установлено' : 'Подключаемся...'}
           </span>
         </div>
       </div>

@@ -2,30 +2,34 @@
  * useWebRTCManager Hook
  * =====================
  * 
- * Manages the lifecycle of RTCPeerConnection, TURN server configuration,
- * and basic connectivity state tracking.
+ * Autonomous WebRTC Manager (Black Box)
  * 
- * This hook isolates WebRTC object ownership from higher-level call logic,
- * making it easier to test and refactor signaling and reconnection strategies.
+ * Manages the complete WebRTC lifecycle independently:
+ * - Subscribes directly to signaling events (offer/answer/candidate)
+ * - Sends signaling messages automatically (no parent routing)
+ * - Auto-initiates calls based on role and signaling readiness
+ * - Self-manages reconnection and ICE restart logic
  * 
- * Currently handles:
- * - TURN server configuration fetch
- * - RTCPeerConnection creation and cleanup
- * - Basic state tracking (connection state, ICE connection state)
+ * The parent component simply passes in:
+ * - localStream (camera/microphone)
+ * - signaling (connection to server)
+ * - isHost (role determination)
  * 
- * Future stages will move:
- * - Signaling logic (offer/answer/candidate handling)
- * - Reconnection logic (ICE restart, full recreate)
- * - Media route detection and remote stream handling
+ * And receives back:
+ * - remoteStream (peer's video/audio)
+ * - connectionStatus (simplified state)
+ * - restart() (manual reconnection trigger)
+ * 
+ * All WebRTC complexity is hidden inside this hook.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchTurnConfig } from '../services/api';
-import { ReconnectionState } from '../services/types';
-import { MediaRouteMode } from './uiConsts';
+import { MediaRouteMode, ReconnectionState, WebRTCTransientStatus } from '../services/types';
 import { parseMediaRouteStats } from '../utils/webrtcStats';
 import { useLatest } from '../utils/useLatest';
 import { createConfiguredPeerConnection } from '../utils/webrtcFactory';
+import type { useSignaling } from './useSignaling';
 
 const TIMEOUTS = {
   RECONNECT_DELAY: 3000,
@@ -37,79 +41,51 @@ const MEDIA_ROUTE_INTERVAL = 5000;
 export interface WebRTCManagerProps {
   /** Local media stream (camera/microphone). Will be added to PC when created. */
   localStream: MediaStream | null;
+  /** Signaling connection object from useSignaling hook */
+  signaling: ReturnType<typeof useSignaling>;
   /** Role of the current peer (host initiates offer, guest waits) */
   isHost: boolean;
-  /** WebSocket signaling ready state */
-  isWsConnected: boolean;
-  /** Signaling sender (offer/answer/ice-candidate) */
-  sendSignal: (type: string, data?: unknown) => void;
-  /** UI status updates (transient messages) */
-  onStatusMessage?: (message: string | null) => void;
-  /** UI error updates */
-  onError?: (message: string | null) => void;
-  /** Reconnection state updates */
-  onReconnectionState?: (state: ReconnectionState) => void;
 }
 
 export interface WebRTCManagerResult {
-  /** Ref to the RTCPeerConnection instance. Null until initialized. */
-  pcRef: React.MutableRefObject<RTCPeerConnection | null>;
-  /** Current RTCPeerConnection state */
-  connectionState: RTCPeerConnectionState | 'new';
-  /** Current ICE connection state */
-  iceConnectionState: RTCIceConnectionState | 'new';
   /** Remote peer media stream */
   remoteStream: MediaStream | null;
+  /** Simplified connection status */
+  connectionStatus: 'new' | 'connecting' | 'connected' | 'failed';
+  /** Raw peer connection state (debug only) */
+  peerConnectionState: RTCPeerConnectionState | 'new';
+  /** Raw ICE connection state (debug only) */
+  iceConnectionState: RTCIceConnectionState | 'new';
+  /** Current error message, if any */
+  error: string | null;
+  /** Transient status code for UI */
+  transientStatus: { code: WebRTCTransientStatus; context?: any } | null;
+  /** Reconnection state */
+  reconnectionState: ReconnectionState;
   /** Media route info: direct/relay/unknown */
   mediaRoute: { mode: MediaRouteMode; detail?: string };
-  /** Start periodic media route checks */
-  startMediaRouteTimer: () => void;
-  /** Stop periodic media route checks */
-  stopMediaRouteTimer: () => void;
-  /** Process signaling message from remote peer */
-  processSignal: (type: string, data?: unknown) => Promise<void>;
-  /** Host-initiated call setup (create and send offer) */
-  initiateCall: () => Promise<void>;
-  /** Reset local signaling state for renegotiation */
-  resetNegotiationState: () => void;
-  /** Mark offer as sent to prevent duplicate offers */
-  markOfferSent: () => void;
-  /** Attempt ICE restart (host-only) */
-  performIceRestart: () => Promise<void>;
-  /** Recreate peer connection when ICE restart fails */
-  recreatePeerConnection: (options?: { fetchNewTurnConfig?: boolean }) => Promise<void>;
-  /** Handle ICE connection loss (schedule restart/recreate) */
-  handleConnectionLoss: () => void;
-  /** Clear reconnection timers and reset attempts on successful connect */
-  handleIceConnected: () => void;
+  /** Manual reconnection trigger */
+  restart: () => void;
   /** Function to explicitly destroy the peer connection and cleanup */
   destroyPeerConnection: () => void;
 }
 
 /**
- * Manages WebRTC peer connection lifecycle.
+ * Manages WebRTC peer connection lifecycle autonomously.
  * 
- * Initialization:
- * - Fetches TURN server config from the backend
- * - Creates RTCPeerConnection with ICE servers
- * - Adds local media tracks if available
- * - Sets up basic state listeners (without complex reconnection logic yet)
+ * This hook:
+ * - Subscribes to signaling events directly (no parent routing)
+ * - Sends signals automatically via signaling object
+ * - Auto-initiates offers when host + signaling ready
+ * - Self-manages all reconnection logic
  * 
- * Cleanup:
- * - Closes peer connection
- * - Nulls the ref
- * 
- * @param props Configuration including localStream and role
- * @returns Object containing pcRef, state, and cleanup functions
+ * @param props Configuration including localStream, signaling, and role
+ * @returns Simplified interface with remoteStream, status, and restart()
  */
 export function useWebRTCManager({
   localStream,
+  signaling,
   isHost,
-  isWsConnected,
-  sendSignal,
-  onStatusMessage,
-  onError,
-  onReconnectionState,
 }: WebRTCManagerProps): WebRTCManagerResult {
   // ============================================================
   // REFS (mutable, non-reactive)
@@ -127,12 +103,7 @@ export function useWebRTCManager({
   const handleIceConnectedRef = useRef<(() => void) | null>(null);
   const mediaRouteTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const sendSignalRef = useLatest(sendSignal);
   const isHostRef = useLatest(isHost);
-  const isWsConnectedRef = useLatest(isWsConnected);
-  const statusMessageRef = useLatest(onStatusMessage);
-  const errorRef = useLatest(onError);
-  const reconnectionStateRef = useLatest(onReconnectionState);
 
   // ============================================================
   // STATE (reactive)
@@ -141,6 +112,13 @@ export function useWebRTCManager({
   const [iceConnectionState, setIceConnectionState] = useState<RTCIceConnectionState | 'new'>('new');
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [mediaRoute, setMediaRoute] = useState<{ mode: MediaRouteMode; detail?: string }>({ mode: 'unknown' });
+
+  // UI state (previously callbacks, now internal)
+  const [error, setError] = useState<string | null>(null);
+  const [transientStatus, setTransientStatus] = useState<
+    { code: WebRTCTransientStatus; context?: any } | null
+  >(null);
+  const [reconnectionState, setReconnectionState] = useState<ReconnectionState>('connected');
 
   // ============================================================
   // SIGNALING HELPERS
@@ -181,7 +159,7 @@ export function useWebRTCManager({
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         await flushPendingCandidates();
-        sendSignalRef.current('answer', answer);
+        signaling.sendAnswer(answer);
         break;
       }
       case 'answer': {
@@ -210,7 +188,7 @@ export function useWebRTCManager({
       default:
         break;
     }
-  }, [flushPendingCandidates, sendSignalRef]);
+  }, [flushPendingCandidates, signaling]);
 
   const initiateCall = useCallback(async () => {
     const pc = pcRef.current;
@@ -223,12 +201,12 @@ export function useWebRTCManager({
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      sendSignalRef.current('offer', offer);
+      signaling.sendOffer(offer);
       offerSentRef.current = true;
     } catch (err) {
       console.error('[WebRTCManager] Failed to create offer', err);
     }
-  }, [isHostRef, sendSignalRef]);
+  }, [isHostRef, signaling]);
 
   const resetNegotiationState = useCallback(() => {
     pendingCandidatesRef.current = [];
@@ -282,7 +260,7 @@ export function useWebRTCManager({
     (pc: RTCPeerConnection) => {
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          sendSignalRef.current('ice-candidate', event.candidate.toJSON());
+          signaling.sendCandidate(event.candidate.toJSON());
         }
       };
 
@@ -296,9 +274,9 @@ export function useWebRTCManager({
       pc.onconnectionstatechange = () => {
         setConnectionState(pc.connectionState ?? 'new');
         if (pc.connectionState === 'connected') {
-          reconnectionStateRef.current?.('connected');
-          errorRef.current?.(null);
-          statusMessageRef.current?.(null);
+          setReconnectionState('connected');
+          setError(null);
+          setTransientStatus(null);
         }
       };
 
@@ -308,9 +286,9 @@ export function useWebRTCManager({
 
         if (state === 'connected' || state === 'completed') {
           handleIceConnectedRef.current?.();
-          reconnectionStateRef.current?.('connected');
-          errorRef.current?.(null);
-          statusMessageRef.current?.(null);
+          setReconnectionState('connected');
+          setError(null);
+          setTransientStatus(null);
         }
 
         if (state === 'disconnected') {
@@ -320,7 +298,7 @@ export function useWebRTCManager({
 
         if (state === 'failed') {
           stopMediaRouteTimer();
-          reconnectionStateRef.current?.('reconnecting');
+          setReconnectionState('reconnecting');
           void recreatePeerConnectionRef.current?.({ fetchNewTurnConfig: true });
         }
 
@@ -329,123 +307,99 @@ export function useWebRTCManager({
         }
       };
     },
-    [errorRef, reconnectionStateRef, sendSignalRef, statusMessageRef, stopMediaRouteTimer]
+    [signaling, stopMediaRouteTimer]
   );
 
-  const performIceRestart = useCallback(async () => {
-    const pc = pcRef.current;
-    if (!pc) {
-      return;
-    }
-
-    if (!isHostRef.current) {
-      statusMessageRef.current?.('Ожидаем переподключение собеседника...');
-      reconnectionStateRef.current?.('reconnecting');
-      return;
-    }
-
-    try {
-      statusMessageRef.current?.('Переподключаем медиасессию...');
-      reconnectionStateRef.current?.('reconnecting');
-      const offer = await pc.createOffer({ iceRestart: true });
-      await pc.setLocalDescription(offer);
-      markOfferSent();
-      sendSignalRef.current('offer', offer);
-    } catch (err) {
-      console.error('[WebRTCManager] ICE restart failed', err);
-      errorRef.current?.('Не удалось переподключить медиасессию. Попробуйте создать новую ссылку.');
-      reconnectionStateRef.current?.('failed');
-    }
-  }, [errorRef, isHostRef, markOfferSent, reconnectionStateRef, sendSignalRef, statusMessageRef]);
+  // ============================================================
+  // PEER CONNECTION RECREATION
+  // Full teardown and rebuild of WebRTC connection
+  // ============================================================
 
   const recreatePeerConnection = useCallback<
     (options?: { fetchNewTurnConfig?: boolean }) => Promise<void>
   >(async (options?: { fetchNewTurnConfig?: boolean }) => {
-      if (isRecreatingRef.current) {
-        console.log('[WebRTCManager] Recreation already in progress, skipping');
-        return;
-      }
+    if (isRecreatingRef.current) {
+      console.log('[WebRTCManager] Recreation already in progress, skipping');
+      return;
+    }
 
-      isRecreatingRef.current = true;
-      recreateAttemptsRef.current += 1;
-      console.log(
-        `[WebRTCManager] Recreating peer connection (attempt ${recreateAttemptsRef.current})`
-      );
+    isRecreatingRef.current = true;
+    recreateAttemptsRef.current += 1;
+    console.log(
+      `[WebRTCManager] Recreating peer connection (attempt ${recreateAttemptsRef.current})`
+    );
 
-      clearIceTimers();
-      statusMessageRef.current?.(
-        `Пересоздаём медиасоединение (попытка ${recreateAttemptsRef.current})...`
-      );
-      reconnectionStateRef.current?.('reconnecting');
-      resetNegotiationState();
+    clearIceTimers();
+    setTransientStatus({
+      code: 'recreating-pc',
+      context: { attempt: recreateAttemptsRef.current },
+    });
+    setReconnectionState('reconnecting');
+    resetNegotiationState();
 
-      if (!isWsConnectedRef.current) {
-        statusMessageRef.current?.('Ожидаем восстановление сигналинга перед пересозданием...');
-        isRecreatingRef.current = false;
-        scheduleRecreateRetryRef.current?.();
-        return;
-      }
+    if (!signaling.isReady) {
+      setTransientStatus({ code: 'signaling-wait' });
+      isRecreatingRef.current = false;
+      scheduleRecreateRetryRef.current?.();
+      return;
+    }
 
-      if (pcRef.current) {
-        pcRef.current.onicecandidate = null;
-        pcRef.current.ontrack = null;
-        pcRef.current.onconnectionstatechange = null;
-        pcRef.current.oniceconnectionstatechange = null;
-        pcRef.current.close();
-        pcRef.current = null;
-      }
+    if (pcRef.current) {
+      pcRef.current.onicecandidate = null;
+      pcRef.current.ontrack = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.oniceconnectionstatechange = null;
+      pcRef.current.close();
+      pcRef.current = null;
+    }
 
-      try {
-        let rtcConfig: RTCConfiguration = {};
-        if (options?.fetchNewTurnConfig) {
-          try {
-            const turnConfig = await fetchTurnConfig();
-            if (turnConfig?.iceServers?.length) {
-              rtcConfig = { iceServers: turnConfig.iceServers };
-              rtcConfigRef.current = rtcConfig;
-            }
-          } catch (err) {
-            console.warn('[WebRTCManager] Failed to fetch fresh TURN config', err);
+    try {
+      let rtcConfig: RTCConfiguration = {};
+      if (options?.fetchNewTurnConfig) {
+        try {
+          const turnConfig = await fetchTurnConfig();
+          if (turnConfig?.iceServers?.length) {
+            rtcConfig = { iceServers: turnConfig.iceServers };
+            rtcConfigRef.current = rtcConfig;
           }
-        } else {
-          rtcConfig = rtcConfigRef.current;
+        } catch (err) {
+          console.warn('[WebRTCManager] Failed to fetch fresh TURN config', err);
         }
-
-        const pc = createConfiguredPeerConnection(rtcConfig, localStream);
-        pcRef.current = pc;
-
-        attachPeerConnectionHandlers(pc);
-
-        sendSignalRef.current('renegotiate-request', {});
-
-        if (isHostRef.current) {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          markOfferSent();
-          sendSignalRef.current('offer', offer);
-          statusMessageRef.current?.('Отправили новое предложение...');
-        } else {
-          statusMessageRef.current?.('Ожидаем предложение от собеседника...');
-          isRecreatingRef.current = false;
-        }
-      } catch (err) {
-        console.error('[WebRTCManager] Failed to recreate peer connection', err);
-        isRecreatingRef.current = false;
-        scheduleRecreateRetryRef.current?.();
+      } else {
+        rtcConfig = rtcConfigRef.current;
       }
-    },
+
+      const pc = createConfiguredPeerConnection(rtcConfig, localStream);
+      pcRef.current = pc;
+
+      attachPeerConnectionHandlers(pc);
+
+      signaling.send('renegotiate-request', {});
+
+      if (isHostRef.current) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        markOfferSent();
+        signaling.sendOffer(offer);
+        setTransientStatus({ code: 'offer-sent' });
+      } else {
+        setTransientStatus({ code: 'answer-waiting' });
+        isRecreatingRef.current = false;
+      }
+    } catch (err) {
+      console.error('[WebRTCManager] Failed to recreate peer connection', err);
+      isRecreatingRef.current = false;
+      scheduleRecreateRetryRef.current?.();
+    }
+  },
     [
       attachPeerConnectionHandlers,
       clearIceTimers,
-      errorRef,
       isHostRef,
-      isWsConnectedRef,
       localStream,
       markOfferSent,
-      reconnectionStateRef,
       resetNegotiationState,
-      sendSignalRef,
-      statusMessageRef,
+      signaling,
     ]
   );
 
@@ -456,28 +410,29 @@ export function useWebRTCManager({
       clearTimeout(recreateRetryTimerRef.current);
     }
 
-    reconnectionStateRef.current?.('reconnecting');
-    statusMessageRef.current?.(
-      `Повторная попытка через ${TIMEOUTS.RECREATE_RETRY / 1000} секунды (попытка ${recreateAttemptsRef.current})...`
-    );
+    setReconnectionState('reconnecting');
+    setTransientStatus({
+      code: 'retry-scheduled',
+      context: { delay: TIMEOUTS.RECREATE_RETRY },
+    });
 
     recreateRetryTimerRef.current = setTimeout(() => {
       recreateRetryTimerRef.current = null;
       void recreatePeerConnection({ fetchNewTurnConfig: true });
     }, TIMEOUTS.RECREATE_RETRY);
-  }, [errorRef, reconnectionStateRef, statusMessageRef, recreatePeerConnection]);
+  }, [recreatePeerConnection]);
 
   scheduleRecreateRetryRef.current = scheduleRecreateRetry;
 
   const handleConnectionLoss = useCallback<() => void>(() => {
     clearIceTimers();
     stopMediaRouteTimer();
-    reconnectionStateRef.current?.('reconnecting');
+    setReconnectionState('reconnecting');
 
     recreateRetryTimerRef.current = setTimeout(() => {
       void recreatePeerConnection({ fetchNewTurnConfig: true });
     }, TIMEOUTS.RECONNECT_DELAY);
-  }, [clearIceTimers, recreatePeerConnection, reconnectionStateRef, stopMediaRouteTimer]);
+  }, [clearIceTimers, recreatePeerConnection, stopMediaRouteTimer]);
 
   handleConnectionLossRef.current = handleConnectionLoss;
 
@@ -489,6 +444,68 @@ export function useWebRTCManager({
   }, [clearIceTimers, startMediaRouteTimer]);
 
   handleIceConnectedRef.current = handleIceConnected;
+
+  // ============================================================
+  // SIGNALING INTEGRATION (STEP_3)
+  // Subscribe to signaling events directly
+  // ============================================================
+
+  useEffect(() => {
+    signaling.setHandlers({
+      onOffer: async (data) => {
+        await processSignal('offer', data);
+      },
+      onAnswer: async (data) => {
+        await processSignal('answer', data);
+      },
+      onCandidate: async (data) => {
+        await processSignal('ice-candidate', data);
+      },
+      onPeerDisconnected: () => {
+        setReconnectionState('peer-disconnected');
+        setTransientStatus({ code: 'peer-disconnected' });
+      },
+      onPeerReconnected: () => {
+        // Check if WebRTC is already connected
+        const isConnected =
+          iceConnectionState === 'connected' ||
+          iceConnectionState === 'completed';
+
+        if (isConnected) {
+          console.log('[WebRTCManager] Peer reconnected, WebRTC already connected');
+          setReconnectionState('connected');
+          setTransientStatus(null);
+          return;
+        }
+        setTransientStatus({ code: 'peer-reconnected' });
+        if (isHostRef.current) {
+          console.log('[WebRTCManager] Peer reconnected, restarting connection');
+          void recreatePeerConnection({ fetchNewTurnConfig: true });
+        } else {
+          setTransientStatus({ code: 'peer-reconnected-waiting' });
+        }
+      },
+      onRenegotiateRequest: () => {
+        console.log('[WebRTCManager] Received renegotiate-request');
+        if (isHostRef.current) {
+          void recreatePeerConnection({ fetchNewTurnConfig: false });
+        } else {
+          setTransientStatus({ code: 'renegotiate-request' });
+        }
+      },
+    });
+  }, [signaling, processSignal, iceConnectionState, isHostRef, recreatePeerConnection]);
+
+  // ============================================================
+  // AUTO-OFFER LOGIC
+  // Automatically initiate call when host + signaling ready
+  // ============================================================
+
+  useEffect(() => {
+    if (isHost && signaling.isReady && pcRef.current && !offerSentRef.current) {
+      void initiateCall();
+    }
+  }, [isHost, signaling.isReady, initiateCall]);
 
   // ============================================================
   // INITIALIZATION
@@ -565,22 +582,42 @@ export function useWebRTCManager({
     };
   }, [initPeerConnection, destroyPeerConnection]);
 
+  // ============================================================
+  // DERIVED STATE
+  // Compute simplified connection status from internal states
+  // ============================================================
+
+  const connectionStatus: 'new' | 'connecting' | 'connected' | 'failed' = (() => {
+    if (iceConnectionState === 'connected' || iceConnectionState === 'completed') {
+      return 'connected';
+    }
+    if (iceConnectionState === 'failed' || connectionState === 'failed') {
+      return 'failed';
+    }
+    if (
+      iceConnectionState === 'checking' ||
+      iceConnectionState === 'disconnected' ||
+      connectionState === 'connecting'
+    ) {
+      return 'connecting';
+    }
+    return 'new';
+  })();
+
+  // ============================================================
+  // PUBLIC API
+  // ============================================================
+
   return {
-    pcRef,
-    connectionState,
-    iceConnectionState,
     remoteStream,
+    connectionStatus,
+    peerConnectionState: connectionState,
+    iceConnectionState,
+    error,
+    transientStatus,
+    reconnectionState,
     mediaRoute,
-    startMediaRouteTimer,
-    stopMediaRouteTimer,
-    processSignal,
-    initiateCall,
-    resetNegotiationState,
-    markOfferSent,
-    performIceRestart,
-    recreatePeerConnection,
-    handleConnectionLoss,
-    handleIceConnected,
+    restart: () => void recreatePeerConnection({ fetchNewTurnConfig: true }),
     destroyPeerConnection,
   };
 }
