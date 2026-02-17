@@ -77,7 +77,11 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   }, [callId]);
 
   // 1. Acquire local media (camera/microphone)
-  const { stream: localStream, error: mediaError } = useLocalMedia();
+  const { stream: localStream, error: mediaError, initMedia } = useLocalMedia();
+
+  useEffect(() => {
+    void initMedia();
+  }, [initMedia]);
 
   // 2. Manage WebSocket signaling and session state
   const signaling = useSignaling({
@@ -100,6 +104,7 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     localStream,
     signaling,
     isHost: signaling.role === 'host',
+    enabled: Boolean(callId) && signaling.callStatus !== 'ended',
   });
 
   const appState = useMemo(() => {

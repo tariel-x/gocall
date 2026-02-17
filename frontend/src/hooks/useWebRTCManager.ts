@@ -34,6 +34,7 @@ import type { useSignaling } from './useSignaling';
 const TIMEOUTS = {
   RECONNECT_DELAY: 3000,
   RECREATE_RETRY: 2000,
+  TURN_CONFIG_MIN_FETCH_INTERVAL: 3000,
 } as const;
 
 const MEDIA_ROUTE_INTERVAL = 5000;
@@ -45,6 +46,8 @@ export interface WebRTCManagerProps {
   signaling: ReturnType<typeof useSignaling>;
   /** Role of the current peer (host initiates offer, guest waits) */
   isHost: boolean;
+  /** Enable WebRTC lifecycle (skip init/reconnect when false) */
+  enabled?: boolean;
 }
 
 export interface WebRTCManagerResult {
@@ -86,6 +89,7 @@ export function useWebRTCManager({
   localStream,
   signaling,
   isHost,
+  enabled = true,
 }: WebRTCManagerProps): WebRTCManagerResult {
   // ============================================================
   // REFS (mutable, non-reactive)
@@ -102,8 +106,15 @@ export function useWebRTCManager({
   const handleConnectionLossRef = useRef<(() => void) | null>(null);
   const handleIceConnectedRef = useRef<(() => void) | null>(null);
   const mediaRouteTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isMountedRef = useRef(true);
+  const lastTurnFetchAtRef = useRef(0);
+  const turnConfigFetchRef = useRef<Promise<RTCConfiguration> | null>(null);
+  const destroyPeerConnectionRef = useRef<(() => void) | null>(null);
+  const initPeerConnectionRef = useRef<(() => Promise<RTCPeerConnection | void>) | null>(null);
 
   const isHostRef = useLatest(isHost);
+  const enabledRef = useLatest(enabled);
+  const localStreamRef = useLatest(localStream);
 
   // ============================================================
   // STATE (reactive)
@@ -256,6 +267,48 @@ export function useWebRTCManager({
     }
   }, []);
 
+  const getRtcConfig = useCallback(async (forceRefresh = false): Promise<RTCConfiguration> => {
+    if (!enabledRef.current) {
+      return rtcConfigRef.current;
+    }
+    const now = Date.now();
+    const hasConfig = Boolean(rtcConfigRef.current?.iceServers?.length);
+    const recentlyFetched = now - lastTurnFetchAtRef.current < TIMEOUTS.TURN_CONFIG_MIN_FETCH_INTERVAL;
+
+    if (!forceRefresh && hasConfig) {
+      return rtcConfigRef.current;
+    }
+
+    if (forceRefresh && hasConfig && recentlyFetched) {
+      return rtcConfigRef.current;
+    }
+
+    if (turnConfigFetchRef.current) {
+      return turnConfigFetchRef.current;
+    }
+
+    if (recentlyFetched && !hasConfig) {
+      return rtcConfigRef.current;
+    }
+
+    turnConfigFetchRef.current = (async () => {
+      try {
+        lastTurnFetchAtRef.current = now;
+        const turnConfig = await fetchTurnConfig();
+        if (turnConfig?.iceServers?.length) {
+          rtcConfigRef.current = { iceServers: turnConfig.iceServers };
+        }
+      } catch (err) {
+        console.warn('[WebRTCManager] Failed to fetch TURN config', err);
+      } finally {
+        turnConfigFetchRef.current = null;
+      }
+      return rtcConfigRef.current;
+    })();
+
+    return turnConfigFetchRef.current;
+  }, []);
+
   const attachPeerConnectionHandlers = useCallback(
     (pc: RTCPeerConnection) => {
       pc.onicecandidate = (event) => {
@@ -299,7 +352,9 @@ export function useWebRTCManager({
         if (state === 'failed') {
           stopMediaRouteTimer();
           setReconnectionState('reconnecting');
-          void recreatePeerConnectionRef.current?.({ fetchNewTurnConfig: true });
+          if (enabledRef.current && localStreamRef.current) {
+            void recreatePeerConnectionRef.current?.({ fetchNewTurnConfig: true });
+          }
         }
 
         if (state === 'closed') {
@@ -316,8 +371,12 @@ export function useWebRTCManager({
   // ============================================================
 
   const recreatePeerConnection = useCallback<
-    (options?: { fetchNewTurnConfig?: boolean }) => Promise<void>
-  >(async (options?: { fetchNewTurnConfig?: boolean }) => {
+    (options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean }) => Promise<void>
+  >(async (options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean }) => {
+    if (!isMountedRef.current || !enabledRef.current || !localStreamRef.current) {
+      return;
+    }
+
     if (isRecreatingRef.current) {
       console.log('[WebRTCManager] Recreation already in progress, skipping');
       return;
@@ -354,27 +413,23 @@ export function useWebRTCManager({
     }
 
     try {
-      let rtcConfig: RTCConfiguration = {};
-      if (options?.fetchNewTurnConfig) {
-        try {
-          const turnConfig = await fetchTurnConfig();
-          if (turnConfig?.iceServers?.length) {
-            rtcConfig = { iceServers: turnConfig.iceServers };
-            rtcConfigRef.current = rtcConfig;
-          }
-        } catch (err) {
-          console.warn('[WebRTCManager] Failed to fetch fresh TURN config', err);
-        }
-      } else {
-        rtcConfig = rtcConfigRef.current;
+      const rtcConfig = options?.fetchNewTurnConfig
+        ? await getRtcConfig(true)
+        : rtcConfigRef.current;
+
+      if (!isMountedRef.current) {
+        isRecreatingRef.current = false;
+        return;
       }
 
-      const pc = createConfiguredPeerConnection(rtcConfig, localStream);
+      const pc = createConfiguredPeerConnection(rtcConfig, localStreamRef.current);
       pcRef.current = pc;
 
       attachPeerConnectionHandlers(pc);
 
-      signaling.send('renegotiate-request', {});
+      if (options?.notifyPeer !== false) {
+        signaling.send('renegotiate-request', {});
+      }
 
       if (isHostRef.current) {
         const offer = await pc.createOffer();
@@ -395,8 +450,8 @@ export function useWebRTCManager({
     [
       attachPeerConnectionHandlers,
       clearIceTimers,
+      getRtcConfig,
       isHostRef,
-      localStream,
       markOfferSent,
       resetNegotiationState,
       signaling,
@@ -418,7 +473,10 @@ export function useWebRTCManager({
 
     recreateRetryTimerRef.current = setTimeout(() => {
       recreateRetryTimerRef.current = null;
-      void recreatePeerConnection({ fetchNewTurnConfig: true });
+      if (!isMountedRef.current) {
+        return;
+      }
+      void recreatePeerConnection({ fetchNewTurnConfig: true, notifyPeer: true });
     }, TIMEOUTS.RECREATE_RETRY);
   }, [recreatePeerConnection]);
 
@@ -430,7 +488,10 @@ export function useWebRTCManager({
     setReconnectionState('reconnecting');
 
     recreateRetryTimerRef.current = setTimeout(() => {
-      void recreatePeerConnection({ fetchNewTurnConfig: true });
+      if (!isMountedRef.current) {
+        return;
+      }
+      void recreatePeerConnection({ fetchNewTurnConfig: true, notifyPeer: true });
     }, TIMEOUTS.RECONNECT_DELAY);
   }, [clearIceTimers, recreatePeerConnection, stopMediaRouteTimer]);
 
@@ -466,6 +527,9 @@ export function useWebRTCManager({
         setTransientStatus({ code: 'peer-disconnected' });
       },
       onPeerReconnected: () => {
+        if (!enabledRef.current || !localStreamRef.current) {
+          return;
+        }
         // Check if WebRTC is already connected
         const isConnected =
           iceConnectionState === 'connected' ||
@@ -480,15 +544,18 @@ export function useWebRTCManager({
         setTransientStatus({ code: 'peer-reconnected' });
         if (isHostRef.current) {
           console.log('[WebRTCManager] Peer reconnected, restarting connection');
-          void recreatePeerConnection({ fetchNewTurnConfig: true });
+          void recreatePeerConnection({ fetchNewTurnConfig: true, notifyPeer: true });
         } else {
           setTransientStatus({ code: 'peer-reconnected-waiting' });
         }
       },
       onRenegotiateRequest: () => {
         console.log('[WebRTCManager] Received renegotiate-request');
+        if (!enabledRef.current || !localStreamRef.current) {
+          return;
+        }
         if (isHostRef.current) {
-          void recreatePeerConnection({ fetchNewTurnConfig: false });
+          void recreatePeerConnection({ fetchNewTurnConfig: false, notifyPeer: false });
         } else {
           setTransientStatus({ code: 'renegotiate-request' });
         }
@@ -513,30 +580,30 @@ export function useWebRTCManager({
   // ============================================================
 
   const initPeerConnection = useCallback(async () => {
+    if (!enabledRef.current || !localStreamRef.current) {
+      return;
+    }
     // Guard: already initialized
     if (pcRef.current) {
       return;
     }
 
-    // Step 1: Fetch TURN server configuration
-    try {
-      const turnConfig = await fetchTurnConfig();
-      if (turnConfig?.iceServers?.length) {
-        rtcConfigRef.current = { iceServers: turnConfig.iceServers };
-      }
-    } catch (err) {
-      console.warn('[WebRTCManager] Failed to fetch TURN config', err);
-      // Proceed without TURN servers if fetch fails
+    await getRtcConfig(true);
+
+    if (!isMountedRef.current) {
+      return;
     }
 
     // Step 2: Create RTCPeerConnection with ICE servers
-    const pc = createConfiguredPeerConnection(rtcConfigRef.current, localStream);
+    const pc = createConfiguredPeerConnection(rtcConfigRef.current, localStreamRef.current);
     pcRef.current = pc;
 
     attachPeerConnectionHandlers(pc);
 
     return pc;
-  }, [attachPeerConnectionHandlers, localStream]);
+  }, [attachPeerConnectionHandlers, getRtcConfig]);
+
+  initPeerConnectionRef.current = initPeerConnection;
 
   // ============================================================
   // CLEANUP
@@ -565,7 +632,10 @@ export function useWebRTCManager({
     // Reset state
     setConnectionState('new');
     setIceConnectionState('new');
+    setRemoteStream(null);
   }, [clearIceTimers, resetNegotiationState, stopMediaRouteTimer]);
+
+  destroyPeerConnectionRef.current = destroyPeerConnection;
 
   // ============================================================
   // LIFECYCLE EFFECT
@@ -573,14 +643,22 @@ export function useWebRTCManager({
   // ============================================================
 
   useEffect(() => {
-    // Initialize peer connection on mount
-    void initPeerConnection();
+    if (!enabled || !localStream) {
+      destroyPeerConnectionRef.current?.();
+      return;
+    }
 
-    // Cleanup on unmount
+    isMountedRef.current = true;
+
+    // Initialize peer connection when enabled and media ready
+    void initPeerConnectionRef.current?.();
+
+    // Cleanup on disable/unmount
     return () => {
-      destroyPeerConnection();
+      isMountedRef.current = false;
+      destroyPeerConnectionRef.current?.();
     };
-  }, [initPeerConnection, destroyPeerConnection]);
+  }, [enabled, localStream]);
 
   // ============================================================
   // DERIVED STATE
@@ -617,7 +695,7 @@ export function useWebRTCManager({
     transientStatus,
     reconnectionState,
     mediaRoute,
-    restart: () => void recreatePeerConnection({ fetchNewTurnConfig: true }),
+    restart: () => void recreatePeerConnection({ fetchNewTurnConfig: true, notifyPeer: true }),
     destroyPeerConnection,
   };
 }
