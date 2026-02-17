@@ -14,6 +14,7 @@
  */
 
 import { useCallback, useEffect, useMemo } from 'react';
+import { leaveCall } from '../services/api';
 import { getSessionState, setCallContext } from '../services/session';
 import { AppCallState, CallSessionDetails, WSState } from '../services/types';
 import { useSignaling } from './useSignaling';
@@ -131,7 +132,12 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
   // End call: send leave message
   const hangup = useCallback(() => {
     signaling.send('leave', {});
-  }, [signaling]);
+      if (callId) {
+        void leaveCall(callId).catch((err) => {
+          console.warn('[CallSession] Failed to end call', err);
+        });
+      }
+    }, [callId, signaling]);
 
   // Derive peer disconnected flag from reconnection state
   const peerDisconnected = reconnectionState === 'peer-disconnected';

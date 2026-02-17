@@ -95,6 +95,9 @@ func (h *Handlers) LeaveCall(c *gin.Context) {
 		return
 	}
 
+	// Notify WS peers about the ended state before closing sockets.
+	h.wsHub.Broadcast(callID, stateMessage(call))
+
 	// Close any active WS sessions for this call.
 	h.wsHub.CloseCall(callID)
 

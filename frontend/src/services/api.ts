@@ -33,3 +33,8 @@ export const joinCall = async (callId: string): Promise<JoinResponse> => {
   const { data } = await apiClient.post<JoinResponse>(`/api/calls/${callId}/join`);
   return data;
 };
+
+export const leaveCall = async (callId: string): Promise<CallResponse> => {
+  const { data } = await apiClient.post<CallResponse>(`/api/calls/${callId}/leave`);
+  return data;
+};
