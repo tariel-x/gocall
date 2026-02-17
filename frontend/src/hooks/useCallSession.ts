@@ -14,7 +14,7 @@
  */
 
 import { useCallback, useEffect, useMemo } from 'react';
-import { setCallContext } from '../services/session';
+import { getSessionState, setCallContext } from '../services/session';
 import { AppCallState, CallSessionDetails, WSState } from '../services/types';
 import { useSignaling } from './useSignaling';
 import { useLocalMedia } from './useLocalMedia';
@@ -83,11 +83,14 @@ export function useCallSession(callId: string | undefined): UseCallSessionResult
     void initMedia();
   }, [initMedia]);
 
+  const sessionState = useMemo(() => getSessionState(), [callId]);
+
   // 2. Manage WebSocket signaling and session state
   const signaling = useSignaling({
     callId,
+    peerId: sessionState.peerId,
     enabled: !!callId,
-    requirePeerId: false,
+    requirePeerId: Boolean(sessionState.peerId),
   });
 
   // 3. Manage WebRTC peer connection

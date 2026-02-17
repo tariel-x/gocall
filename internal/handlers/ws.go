@@ -98,7 +98,10 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 			PeerOnline:  otherPeerOnline(call, peerID),
 		}),
 	})
-	client.send <- joinMsg
+	if !client.trySend(joinMsg) {
+		_ = client.conn.Close()
+		return
+	}
 
 	if reconnected {
 		reconnectMsg, _ := json.Marshal(wsEnvelopeV2{Type: "peer-reconnected", From: peerID})
@@ -217,9 +220,7 @@ func (h *Handlers) heartbeatState(client *wsClientV2, stop <-chan struct{}) {
 			if len(msg) == 0 {
 				continue
 			}
-			select {
-			case client.send <- msg:
-			default:
+			if !client.trySend(msg) {
 				_ = client.conn.Close()
 				return
 			}

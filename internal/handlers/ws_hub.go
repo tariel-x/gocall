@@ -14,6 +14,20 @@ type wsClientV2 struct {
 	closeOnce sync.Once
 }
 
+func (c *wsClientV2) trySend(payload []byte) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	select {
+	case c.send <- payload:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *wsClientV2) closeSend() {
 	c.closeOnce.Do(func() {
 		close(c.send)
@@ -80,13 +94,11 @@ func (h *WSHubV2) SendTo(callID, peerID string, payload []byte) bool {
 		return false
 	}
 
-	select {
-	case client.send <- payload:
-		return true
-	default:
+	if !client.trySend(payload) {
 		_ = client.conn.Close()
 		return false
 	}
+	return true
 }
 
 func (h *WSHubV2) SendToOther(callID, fromPeerID string, payload []byte) bool {
@@ -107,13 +119,11 @@ func (h *WSHubV2) SendToOther(callID, fromPeerID string, payload []byte) bool {
 		return false
 	}
 
-	select {
-	case other.send <- payload:
-		return true
-	default:
+	if !other.trySend(payload) {
 		_ = other.conn.Close()
 		return false
 	}
+	return true
 }
 
 func (h *WSHubV2) Broadcast(callID string, payload []byte) {
@@ -128,9 +138,7 @@ func (h *WSHubV2) Broadcast(callID string, payload []byte) {
 	h.mu.Unlock()
 
 	for _, client := range clients {
-		select {
-		case client.send <- payload:
-		default:
+		if !client.trySend(payload) {
 			_ = client.conn.Close()
 		}
 	}
