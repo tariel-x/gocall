@@ -144,6 +144,8 @@ export function useSignaling({
         handlers.current.onCandidate(message.data);
       },
       onLeave: () => {
+        setCallStatus('ended');
+        setParticipants(1);
         handlers.current.onPeerLeft();
         leaveCallbackRef.current?.();
       },
