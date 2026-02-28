@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log/slog"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -62,11 +63,13 @@ func (h *WSHubV2) Add(client *wsClientV2) {
 	}
 
 	peers[client.peerID] = client
+	slog.Default().Debug("ws hub add", "call_id", client.callID, "peer_id", client.peerID)
 }
 
 func (h *WSHubV2) Remove(callID, peerID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	slog.Default().Debug("ws hub remove", "call_id", callID, "peer_id", peerID)
 
 	peers, ok := h.calls[callID]
 	if !ok {
@@ -88,13 +91,14 @@ func (h *WSHubV2) SendTo(callID, peerID string, payload []byte) bool {
 		peers := h.calls[callID]
 		return peers[peerID]
 	}()
-	h.mu.Unlock()
-
 	if client == nil {
+		h.mu.Unlock()
 		return false
 	}
+	h.mu.Unlock()
 
 	if !client.trySend(payload) {
+		slog.Default().Debug("ws hub send direct blocked", "call_id", callID, "to_peer_id", peerID)
 		_ = client.conn.Close()
 		return false
 	}
@@ -113,13 +117,14 @@ func (h *WSHubV2) SendToOther(callID, fromPeerID string, payload []byte) bool {
 			break
 		}
 	}
-	h.mu.Unlock()
-
 	if other == nil {
+		h.mu.Unlock()
 		return false
 	}
+	h.mu.Unlock()
 
 	if !other.trySend(payload) {
+		slog.Default().Debug("ws hub send other blocked", "call_id", callID, "from_peer_id", fromPeerID, "to_peer_id", other.peerID)
 		_ = other.conn.Close()
 		return false
 	}

@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -47,6 +48,7 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "call_id is required"})
 		return
 	}
+	slog.Default().Debug("ws connect request", "call_id", callID, "peer_id", peerID, "ip", c.ClientIP())
 
 	now := h.nowFn()
 
@@ -73,9 +75,11 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 			return
 		}
 	}
+	slog.Default().Debug("ws resolved peer", "call_id", callID, "peer_id", peerID, "role", role, "reconnected", reconnected)
 
 	conn, err := h.wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
+		slog.Default().Warn("ws upgrade failed", "call_id", callID, "peer_id", peerID, "error", err)
 		return
 	}
 
@@ -87,6 +91,7 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 	}
 
 	h.wsHub.Add(client)
+	slog.Default().Debug("ws connected", "call_id", callID, "peer_id", peerID, "role", role)
 
 	// Initial join ack to the client.
 	joinMsg, _ := json.Marshal(wsEnvelopeV2{
@@ -99,16 +104,21 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 		}),
 	})
 	if !client.trySend(joinMsg) {
+		slog.Default().Debug("ws send join failed", "call_id", callID, "peer_id", peerID)
 		_ = client.conn.Close()
 		return
 	}
+	slog.Default().Debug("ws sent join", "call_id", callID, "peer_id", peerID, "role", role, "peer_online", otherPeerOnline(call, peerID))
 
 	if reconnected {
 		reconnectMsg, _ := json.Marshal(wsEnvelopeV2{Type: "peer-reconnected", From: peerID})
-		h.wsHub.SendToOther(callID, peerID, reconnectMsg)
+		if ok := h.wsHub.SendToOther(callID, peerID, reconnectMsg); !ok {
+			slog.Default().Debug("ws peer-reconnected not delivered", "call_id", callID, "from_peer_id", peerID)
+		}
 	}
 
 	h.broadcastState(call)
+	slog.Default().Debug("ws broadcast state", "call_id", callID, "peer_id", peerID)
 
 	stopHeartbeat := make(chan struct{})
 	go h.writePump(client)
@@ -119,6 +129,7 @@ func (h *Handlers) HandleWebSocket(c *gin.Context) {
 
 func (h *Handlers) readPump(client *wsClientV2) {
 	defer func() {
+		slog.Default().Debug("ws disconnect", "call_id", client.callID, "peer_id", client.peerID)
 		_ = client.conn.Close()
 		h.calls.MarkPeerDisconnected(client.callID, client.peerID, h.nowFn())
 		h.wsHub.Remove(client.callID, client.peerID)
@@ -126,7 +137,9 @@ func (h *Handlers) readPump(client *wsClientV2) {
 		// Do not end the call on disconnect.
 		// Clients may navigate between SPA screens and reconnect.
 		disconnectMsg, _ := json.Marshal(wsEnvelopeV2{Type: "peer-disconnected", From: client.peerID})
-		h.wsHub.SendToOther(client.callID, client.peerID, disconnectMsg)
+		if ok := h.wsHub.SendToOther(client.callID, client.peerID, disconnectMsg); !ok {
+			slog.Default().Debug("ws peer-disconnected not delivered", "call_id", client.callID, "from_peer_id", client.peerID)
+		}
 	}()
 
 	_ = client.conn.SetReadDeadline(time.Now().Add(wsPongWait))
@@ -138,17 +151,22 @@ func (h *Handlers) readPump(client *wsClientV2) {
 	for {
 		_, payload, err := client.conn.ReadMessage()
 		if err != nil {
+			slog.Default().Debug("ws read error", "call_id", client.callID, "peer_id", client.peerID, "error", err)
 			return
 		}
 
 		var msg wsEnvelopeV2
 		if err := json.Unmarshal(payload, &msg); err != nil {
+			slog.Default().Debug("ws bad json", "call_id", client.callID, "peer_id", client.peerID, "error", err)
 			continue
 		}
 
 		if msg.Type == "ping" {
 			continue
 		}
+
+		// Avoid logging full SDP/candidate payloads (may contain IPs). Log sizes/type only.
+		slog.Default().Debug("ws recv", "call_id", client.callID, "peer_id", client.peerID, "type", msg.Type, "to", msg.To, "data_bytes", len(msg.Data))
 
 		msg.From = client.peerID
 		forward, err := json.Marshal(msg)
@@ -157,12 +175,16 @@ func (h *Handlers) readPump(client *wsClientV2) {
 		}
 
 		if msg.To != "" {
-			h.wsHub.SendTo(client.callID, msg.To, forward)
+			if ok := h.wsHub.SendTo(client.callID, msg.To, forward); !ok {
+				slog.Default().Debug("ws forward direct not delivered", "call_id", client.callID, "from_peer_id", client.peerID, "to_peer_id", msg.To, "type", msg.Type)
+			}
 			continue
 		}
 
 		// If 'to' is omitted, route to the other participant.
-		h.wsHub.SendToOther(client.callID, client.peerID, forward)
+		if ok := h.wsHub.SendToOther(client.callID, client.peerID, forward); !ok {
+			slog.Default().Debug("ws forward other not delivered", "call_id", client.callID, "from_peer_id", client.peerID, "type", msg.Type)
+		}
 	}
 }
 

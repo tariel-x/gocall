@@ -2,6 +2,10 @@ export interface TurnConfig {
   iceServers?: RTCIceServer[];
 }
 
+export interface ClientConfig {
+  debug: boolean;
+}
+
 export type CallStatus = 'waiting' | 'active' | 'ended';
 export type ReconnectionState = 'connected' | 'reconnecting' | 'peer-disconnected' | 'failed';
 export type WSState = 'connecting' | 'reconnecting' | 'ready' | 'disconnected';

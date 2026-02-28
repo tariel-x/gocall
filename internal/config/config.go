@@ -12,6 +12,7 @@ type Config struct {
 	Domain    string
 	TURNPort  int
 	TURNRealm string
+	LogLevel  string
 	// Backend-only mode fields
 	HTTPOnly    bool
 	FrontendURI string
@@ -28,6 +29,7 @@ func Load(httpOnly *bool) *Config {
 		Domain:    getEnv("DOMAIN", "localhost"),
 		TURNPort:  getEnvInt("TURN_PORT", 3478),
 		TURNRealm: getEnv("TURN_REALM", "familycall"),
+		LogLevel:  strings.ToLower(getEnv("LOG_LEVEL", "info")),
 
 		FrontendURI: getEnv("FRONTEND_URI", ""),
 	}

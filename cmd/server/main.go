@@ -47,6 +47,23 @@ func main() {
 
 	cfg := config.Load(httpOnly)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Use LOG_LEVEL=debug|info|warn|error to control verbosity.
+	// Default is info to avoid noisy logs in production.
+	{
+		level := new(slog.LevelVar)
+		switch strings.ToLower(cfg.LogLevel) {
+		case "debug":
+			level.Set(slog.LevelDebug)
+		case "warn", "warning":
+			level.Set(slog.LevelWarn)
+		case "error":
+			level.Set(slog.LevelError)
+		default:
+			level.Set(slog.LevelInfo)
+		}
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	}
+	slog.SetDefault(logger)
 
 	// Log version and build info
 	logger.Info(fmt.Sprintf("Gocall Server v%s (build: %d)", AppVersion, buildTimestamp))
@@ -125,6 +142,7 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config, logger *slog.Logger) 
 	// Public routes
 	api := router.Group("/api")
 	{
+		api.GET("/client-config", h.GetClientConfig)
 		api.GET("/turn-config", h.GetTURNConfig)
 		api.POST("/calls", h.CreateCall)
 		api.GET("/calls/:call_id", h.GetCall)
@@ -185,16 +203,10 @@ func startServer(router *gin.Engine, cfg *config.Config, selfSigned bool, logger
 		http.Redirect(w, r, httpsURL, http.StatusMovedPermanently)
 	})
 
-	// Chain handlers: autocert first (for ACME challenges), then redirect
-	httpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is an ACME challenge
-		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
-			m.HTTPHandler(nil).ServeHTTP(w, r)
-			return
-		}
-		// Otherwise redirect to HTTPS
-		redirectHandler.ServeHTTP(w, r)
-	})
+	// Initialize ACME HTTP handler once at startup.
+	// This is important because it flips autocert into trying http-01 challenges,
+	// even if the first certificate attempt happens before any HTTP requests.
+	acmeHTTPHandler := m.HTTPHandler(redirectHandler)
 
 	// net/http errors (including TLS handshake errors) -> slog JSON
 	errorLog := log.New(newTLSErrorWriter(logger), "", 0)
@@ -202,7 +214,7 @@ func startServer(router *gin.Engine, cfg *config.Config, selfSigned bool, logger
 	// Create HTTP server for Let's Encrypt challenge and redirects (port 80)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.HTTPPort,
-		Handler:      httpHandler,
+		Handler:      acmeHTTPHandler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -431,7 +443,11 @@ func getCertsDirectory() string {
 // - Removes www. prefix if present
 // - Trims whitespace
 func normalizeDomain(domain string) string {
-	domain = strings.ToLower(strings.TrimSpace(domain))
+	domain = strings.TrimSpace(domain)
+	if host, _, err := net.SplitHostPort(domain); err == nil {
+		domain = host
+	}
+	domain = strings.ToLower(domain)
 	// Remove www. prefix if present
 	domain = strings.TrimPrefix(domain, "www.")
 	return domain

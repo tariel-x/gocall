@@ -35,6 +35,13 @@ func Initialize(port int, realm string, logger *slog.Logger) (*TURNServer, error
 		return nil, fmt.Errorf("failed to create UDP listener: %w", err)
 	}
 
+	// Create TCP listener (useful on networks where UDP is blocked)
+	tcpListener, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		_ = udpListener.Close()
+		return nil, fmt.Errorf("failed to create TCP listener: %w", err)
+	}
+
 	// Load or generate credentials
 	creds := loadOrGenerateCredentials(logger)
 
@@ -59,9 +66,20 @@ func Initialize(port int, realm string, logger *slog.Logger) (*TURNServer, error
 				},
 			},
 		},
+		ListenerConfigs: []turn.ListenerConfig{
+			{
+				Listener: tcpListener,
+				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+					RelayAddress: publicIP,  // Use public IP for relay
+					Address:      "0.0.0.0", // Listen on all interfaces
+				},
+			},
+		},
 	})
 
 	if err != nil {
+		_ = udpListener.Close()
+		_ = tcpListener.Close()
 		return nil, fmt.Errorf("failed to create TURN server: %w", err)
 	}
 

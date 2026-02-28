@@ -29,12 +29,14 @@ import { MediaRouteMode, ReconnectionState, WebRTCTransientStatus } from '../ser
 import { parseMediaRouteStats } from '../utils/webrtcStats';
 import { useLatest } from '../utils/useLatest';
 import { createConfiguredPeerConnection } from '../utils/webrtcFactory';
+import { debugLog, debugWarn } from '../utils/debug';
 import type { useSignaling } from './useSignaling';
 
 const TIMEOUTS = {
   RECONNECT_DELAY: 3000,
   RECREATE_RETRY: 2000,
   TURN_CONFIG_MIN_FETCH_INTERVAL: 3000,
+  RELAY_FALLBACK_MS: 8000,
 } as const;
 
 const MEDIA_ROUTE_INTERVAL = 5000;
@@ -99,10 +101,12 @@ export function useWebRTCManager({
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const offerSentRef = useRef(false);
   const recreateRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const relayFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recreateAttemptsRef = useRef(0);
   const isRecreatingRef = useRef(false);
+  const relayForcedRef = useRef(false);
   const scheduleRecreateRetryRef = useRef<(() => void) | null>(null);
-  const recreatePeerConnectionRef = useRef<((options?: { fetchNewTurnConfig?: boolean }) => Promise<void>) | null>(null);
+  const recreatePeerConnectionRef = useRef<((options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean; forceRelay?: boolean }) => Promise<void>) | null>(null);
   const handleConnectionLossRef = useRef<(() => void) | null>(null);
   const handleIceConnectedRef = useRef<(() => void) | null>(null);
   const mediaRouteTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -141,6 +145,9 @@ export function useWebRTCManager({
     if (!pc || !pc.remoteDescription) {
       return;
     }
+    if (pendingCandidatesRef.current.length > 0) {
+      debugLog('[WebRTC] flush pending candidates', { count: pendingCandidatesRef.current.length });
+    }
     while (pendingCandidatesRef.current.length > 0) {
       const candidate = pendingCandidatesRef.current.shift();
       if (!candidate) {
@@ -149,16 +156,68 @@ export function useWebRTCManager({
       try {
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (err) {
-        console.warn('[WebRTCManager] Failed to add ICE candidate', err);
+        debugWarn('[WebRTC] addIceCandidate failed', err);
       }
     }
   }, []);
 
+  const summarizeCandidate = useCallback((candidate: RTCIceCandidateInit | null | undefined) => {
+    if (!candidate) {
+      return null;
+    }
+    // candidate.candidate often contains IPs; log only derived typ/protocol.
+    const parts = (candidate.candidate ?? '').split(' ');
+    const protocol = parts[2] ?? undefined;
+    const typIndex = parts.indexOf('typ');
+    const typ = typIndex >= 0 ? parts[typIndex + 1] : undefined;
+    return {
+      sdpMid: candidate.sdpMid ?? undefined,
+      sdpMLineIndex: candidate.sdpMLineIndex ?? undefined,
+      protocol,
+      typ,
+    };
+  }, []);
+
+  const serializeIceCandidate = useCallback((candidate: RTCIceCandidate): RTCIceCandidateInit => {
+    const anyCandidate = candidate as any;
+    try {
+      if (typeof anyCandidate?.toJSON === 'function') {
+        const json = anyCandidate.toJSON() as RTCIceCandidateInit;
+        // Some environments may return an empty object from toJSON().
+        if (json && typeof json.candidate === 'string') {
+          return json;
+        }
+      }
+    } catch (err) {
+      debugWarn('[WebRTC] candidate.toJSON failed, falling back', err);
+    }
+
+    return {
+      candidate: candidate.candidate,
+      sdpMid: candidate.sdpMid ?? undefined,
+      sdpMLineIndex: candidate.sdpMLineIndex ?? undefined,
+      usernameFragment: (candidate as any).usernameFragment ?? undefined,
+    };
+  }, []);
+
   const processSignal = useCallback(async (type: string, data?: unknown) => {
     const pc = pcRef.current;
-    if (!pc || !type) {
+    if (!type) {
       return;
     }
+
+    if (!pc) {
+      debugLog('[WebRTC] drop signal (pc not ready)', { type });
+      return;
+    }
+
+    debugLog('[WebRTC] process signal', {
+      type,
+      signalingState: pc.signalingState,
+      iceConnectionState: pc.iceConnectionState,
+      connectionState: pc.connectionState,
+      hasRemoteDescription: Boolean(pc.remoteDescription),
+    });
 
     switch (type) {
       case 'offer': {
@@ -166,11 +225,16 @@ export function useWebRTCManager({
         if (!description) {
           return;
         }
+        debugLog('[WebRTC] recv offer', { sdpLength: description.sdp?.length, sdpType: description.type });
         await pc.setRemoteDescription(new RTCSessionDescription(description));
+        debugLog('[WebRTC] setRemoteDescription(offer) ok', { signalingState: pc.signalingState });
         const answer = await pc.createAnswer();
+        debugLog('[WebRTC] createAnswer ok', { sdpLength: answer.sdp?.length });
         await pc.setLocalDescription(answer);
+        debugLog('[WebRTC] setLocalDescription(answer) ok', { signalingState: pc.signalingState });
         await flushPendingCandidates();
         signaling.sendAnswer(answer);
+        debugLog('[WebRTC] sent answer');
         break;
       }
       case 'answer': {
@@ -178,9 +242,13 @@ export function useWebRTCManager({
         if (!description) {
           return;
         }
+        debugLog('[WebRTC] recv answer', { sdpLength: description.sdp?.length, sdpType: description.type });
         if (pc.signalingState === 'have-local-offer') {
           await pc.setRemoteDescription(new RTCSessionDescription(description));
+          debugLog('[WebRTC] setRemoteDescription(answer) ok', { signalingState: pc.signalingState });
           await flushPendingCandidates();
+        } else {
+          debugLog('[WebRTC] ignore answer (unexpected signalingState)', { signalingState: pc.signalingState });
         }
         break;
       }
@@ -189,17 +257,20 @@ export function useWebRTCManager({
         if (!candidate) {
           return;
         }
+        debugLog('[WebRTC] recv candidate', { summary: summarizeCandidate(candidate) });
         if (pc.remoteDescription) {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          debugLog('[WebRTC] addIceCandidate ok');
         } else {
           pendingCandidatesRef.current.push(candidate);
+          debugLog('[WebRTC] buffer candidate (no remoteDescription)', { buffered: pendingCandidatesRef.current.length });
         }
         break;
       }
       default:
         break;
     }
-  }, [flushPendingCandidates, signaling]);
+  }, [flushPendingCandidates, signaling, summarizeCandidate]);
 
   const initiateCall = useCallback(async () => {
     const pc = pcRef.current;
@@ -210,9 +281,13 @@ export function useWebRTCManager({
       return;
     }
     try {
+      debugLog('[WebRTC] createOffer start');
       const offer = await pc.createOffer();
+      debugLog('[WebRTC] createOffer ok', { sdpLength: offer.sdp?.length });
       await pc.setLocalDescription(offer);
+      debugLog('[WebRTC] setLocalDescription(offer) ok', { signalingState: pc.signalingState });
       signaling.sendOffer(offer);
+      debugLog('[WebRTC] sent offer');
       offerSentRef.current = true;
     } catch (err) {
       console.error('[WebRTCManager] Failed to create offer', err);
@@ -265,6 +340,36 @@ export function useWebRTCManager({
       clearTimeout(recreateRetryTimerRef.current);
       recreateRetryTimerRef.current = null;
     }
+    if (relayFallbackTimerRef.current) {
+      clearTimeout(relayFallbackTimerRef.current);
+      relayFallbackTimerRef.current = null;
+    }
+  }, []);
+
+  const buildRtcConfig = useCallback((forceRelay = false): RTCConfiguration => {
+    if (!forceRelay) {
+      return rtcConfigRef.current;
+    }
+    return {
+      ...rtcConfigRef.current,
+      iceTransportPolicy: 'relay',
+    };
+  }, []);
+
+  const scheduleRelayFallback = useCallback(() => {
+    if (relayForcedRef.current || relayFallbackTimerRef.current) {
+      return;
+    }
+    relayFallbackTimerRef.current = setTimeout(() => {
+      relayFallbackTimerRef.current = null;
+      const state = pcRef.current?.iceConnectionState;
+      if (relayForcedRef.current || state === 'connected' || state === 'completed') {
+        return;
+      }
+      relayForcedRef.current = true;
+      debugLog('[WebRTC] relay fallback timeout reached, switching to relay');
+      void recreatePeerConnectionRef.current?.({ fetchNewTurnConfig: true, notifyPeer: true, forceRelay: true });
+    }, TIMEOUTS.RELAY_FALLBACK_MS);
   }, []);
 
   const getRtcConfig = useCallback(async (forceRefresh = false): Promise<RTCConfiguration> => {
@@ -294,9 +399,13 @@ export function useWebRTCManager({
     turnConfigFetchRef.current = (async () => {
       try {
         lastTurnFetchAtRef.current = now;
+        debugLog('[WebRTC] fetch TURN config start');
         const turnConfig = await fetchTurnConfig();
         if (turnConfig?.iceServers?.length) {
           rtcConfigRef.current = { iceServers: turnConfig.iceServers };
+          debugLog('[WebRTC] fetch TURN config ok', { iceServers: turnConfig.iceServers.length });
+        } else {
+          debugLog('[WebRTC] fetch TURN config empty');
         }
       } catch (err) {
         console.warn('[WebRTCManager] Failed to fetch TURN config', err);
@@ -311,21 +420,50 @@ export function useWebRTCManager({
 
   const attachPeerConnectionHandlers = useCallback(
     (pc: RTCPeerConnection) => {
+      debugLog('[WebRTC] attach handlers');
+
       pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          signaling.sendCandidate(event.candidate.toJSON());
+        if (!event.candidate) {
+          return;
         }
+        try {
+          const payload = serializeIceCandidate(event.candidate);
+          debugLog('[WebRTC] local candidate', { summary: summarizeCandidate(payload) });
+          signaling.sendCandidate(payload);
+          debugLog('[WebRTC] sent candidate');
+        } catch (err) {
+          debugWarn('[WebRTC] failed to send local candidate', err);
+        }
+      };
+
+      pc.onicegatheringstatechange = () => {
+        debugLog('[WebRTC] iceGatheringState', { state: pc.iceGatheringState });
+      };
+
+      pc.onsignalingstatechange = () => {
+        debugLog('[WebRTC] signalingState', { state: pc.signalingState });
+      };
+
+      pc.onicecandidateerror = (event: any) => {
+        debugWarn('[WebRTC] icecandidateerror', {
+          errorCode: event?.errorCode,
+          errorText: event?.errorText,
+          url: event?.url,
+        });
       };
 
       pc.ontrack = (event) => {
         const [stream] = event.streams;
+        debugLog('[WebRTC] ontrack', { kind: event.track?.kind, streams: event.streams?.length });
         if (stream) {
           setRemoteStream(stream);
+          debugLog('[WebRTC] remote stream set', { id: stream.id, tracks: stream.getTracks().map((t) => t.kind) });
         }
       };
 
       pc.onconnectionstatechange = () => {
         setConnectionState(pc.connectionState ?? 'new');
+        debugLog('[WebRTC] connectionState', { state: pc.connectionState });
         if (pc.connectionState === 'connected') {
           setReconnectionState('connected');
           setError(null);
@@ -336,6 +474,8 @@ export function useWebRTCManager({
       pc.oniceconnectionstatechange = () => {
         const state = pc.iceConnectionState ?? 'new';
         setIceConnectionState(state);
+
+        debugLog('[WebRTC] iceConnectionState', { state });
 
         if (state === 'connected' || state === 'completed') {
           handleIceConnectedRef.current?.();
@@ -362,7 +502,7 @@ export function useWebRTCManager({
         }
       };
     },
-    [signaling, stopMediaRouteTimer]
+    [serializeIceCandidate, signaling, stopMediaRouteTimer, summarizeCandidate]
   );
 
   // ============================================================
@@ -371,22 +511,20 @@ export function useWebRTCManager({
   // ============================================================
 
   const recreatePeerConnection = useCallback<
-    (options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean }) => Promise<void>
-  >(async (options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean }) => {
+    (options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean; forceRelay?: boolean }) => Promise<void>
+  >(async (options?: { fetchNewTurnConfig?: boolean; notifyPeer?: boolean; forceRelay?: boolean }) => {
     if (!isMountedRef.current || !enabledRef.current || !localStreamRef.current) {
       return;
     }
 
     if (isRecreatingRef.current) {
-      console.log('[WebRTCManager] Recreation already in progress, skipping');
+      debugLog('[WebRTC] recreate already in progress, skipping');
       return;
     }
 
     isRecreatingRef.current = true;
     recreateAttemptsRef.current += 1;
-    console.log(
-      `[WebRTCManager] Recreating peer connection (attempt ${recreateAttemptsRef.current})`
-    );
+    debugLog('[WebRTC] recreating peer connection', { attempt: recreateAttemptsRef.current, options });
 
     clearIceTimers();
     setTransientStatus({
@@ -422,7 +560,7 @@ export function useWebRTCManager({
         return;
       }
 
-      const pc = createConfiguredPeerConnection(rtcConfig, localStreamRef.current);
+      const pc = createConfiguredPeerConnection(buildRtcConfig(options?.forceRelay), localStreamRef.current);
       pcRef.current = pc;
 
       attachPeerConnectionHandlers(pc);
@@ -437,6 +575,7 @@ export function useWebRTCManager({
         markOfferSent();
         signaling.sendOffer(offer);
         setTransientStatus({ code: 'offer-sent' });
+        scheduleRelayFallback();
       } else {
         setTransientStatus({ code: 'answer-waiting' });
         isRecreatingRef.current = false;
@@ -449,12 +588,14 @@ export function useWebRTCManager({
   },
     [
       attachPeerConnectionHandlers,
+      buildRtcConfig,
       clearIceTimers,
       getRtcConfig,
       isHostRef,
       markOfferSent,
       resetNegotiationState,
       signaling,
+      scheduleRelayFallback,
     ]
   );
 
@@ -595,13 +736,15 @@ export function useWebRTCManager({
     }
 
     // Step 2: Create RTCPeerConnection with ICE servers
-    const pc = createConfiguredPeerConnection(rtcConfigRef.current, localStreamRef.current);
+    const pc = createConfiguredPeerConnection(buildRtcConfig(relayForcedRef.current), localStreamRef.current);
     pcRef.current = pc;
 
     attachPeerConnectionHandlers(pc);
 
+    scheduleRelayFallback();
+
     return pc;
-  }, [attachPeerConnectionHandlers, getRtcConfig]);
+  }, [attachPeerConnectionHandlers, buildRtcConfig, getRtcConfig, scheduleRelayFallback]);
 
   initPeerConnectionRef.current = initPeerConnection;
 

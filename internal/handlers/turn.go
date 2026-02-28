@@ -22,8 +22,8 @@ type PushSubscribeRequest struct {
 func (h *Handlers) GetTURNConfig(c *gin.Context) {
 	// Get TURN server configuration - use only our TURN server
 	// TURN servers also support STUN, so we don't need separate STUN servers
-	// Note: We use "turn:" (not "turns:") because our TURN server is UDP-only
-	// TURNS (TLS) requires TCP/TLS, but we're using UDP which doesn't support TLS
+	// Note: We use "turn:" (not "turns:") because we're not serving TURN over TLS.
+	// We provide both UDP and TCP transports to improve connectivity on restrictive networks.
 	// Media encryption is handled by DTLS-SRTP in WebRTC
 
 	host := c.Request.Host
@@ -34,9 +34,10 @@ func (h *Handlers) GetTURNConfig(c *gin.Context) {
 	// Get credentials from TURN server
 	creds := h.turnServer.GetCredentials()
 
-	// TURN server URL - format: turn:host:port
+	// TURN server URLs
+	turnURLUDP := fmt.Sprintf("turn:%s:%d", host, h.config.TURNPort)
+	turnURLTCP := fmt.Sprintf("turn:%s:%d?transport=tcp", host, h.config.TURNPort)
 	// Also include STUN URL (TURN servers support STUN protocol)
-	turnURL := fmt.Sprintf("turn:%s:%d", host, h.config.TURNPort)
 	stunURL := fmt.Sprintf("stun:%s:%d", host, h.config.TURNPort)
 
 	iceServers := []map[string]interface{}{
@@ -44,7 +45,7 @@ func (h *Handlers) GetTURNConfig(c *gin.Context) {
 			"urls": stunURL,
 		},
 		{
-			"urls":       turnURL,
+			"urls":       []string{turnURLUDP, turnURLTCP},
 			"username":   creds.Username,
 			"credential": creds.Password,
 		},

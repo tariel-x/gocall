@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { CallDetailsResponse, CallResponse, JoinResponse, TurnConfig } from './types';
+import { CallDetailsResponse, CallResponse, ClientConfig, JoinResponse, TurnConfig } from './types';
 
 const resolveBaseURL = (): string => {
   const value = window.API_ADDRESS;
@@ -16,6 +16,11 @@ export const apiClient = axios.create({
 
 export const fetchTurnConfig = async (): Promise<TurnConfig> => {
   const { data } = await apiClient.get<TurnConfig>('/api/turn-config');
+  return data;
+};
+
+export const fetchClientConfig = async (): Promise<ClientConfig> => {
+  const { data } = await apiClient.get<ClientConfig>('/api/client-config');
   return data;
 };
 

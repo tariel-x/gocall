@@ -1,7 +1,8 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { subscribeToSignaling, SignalingSubscription, SignalingEnvelope } from '../services/signaling';
 import { setPeerContext } from '../services/session';
-import { CallStatus, PeerRole, WSState } from '../services/types';
+import { CallStatus, PeerRole } from '../services/types';
+import { debugLog, debugWarn } from '../utils/debug';
 
 interface SignalingOptions {
   callId?: string;
@@ -15,7 +16,7 @@ interface SignalingOptions {
 
 /**
  * Smart signaling hook that manages WebSocket connection and message routing.
- * Encapsulates connection lifecycle, message queueing, and event handling.
+ * Encapsulates connection lifecycle and event handling.
  * 
  * This hook acts as a comprehensive manager for server communication,
  * hiding WebSocket complexity from the rest of the application.
@@ -34,7 +35,6 @@ export function useSignaling({
   const [participants, setParticipants] = useState(1);
   const [callStatus, setCallStatus] = useState<CallStatus>('waiting');
   const subscriptionRef = useRef<SignalingSubscription | null>(null);
-  const messageQueue = useRef<SignalingEnvelope[]>([]);
 
   // Event handlers that can be set by consumers (e.g., WebRTC manager)
   // Using Ref to avoid recreating subscriptions on every render
@@ -65,17 +65,17 @@ export function useSignaling({
     handlers.current = { ...handlers.current, ...newHandlers };
   }, []);
 
-  // Generic send function with message queueing
+  // Generic send function
   const send = useCallback((type: string, payload: any) => {
     const message: SignalingEnvelope = { type, data: payload };
 
     if (subscriptionRef.current && isReady) {
+      debugLog('[Signaling] send', { type, callId, peerId });
       subscriptionRef.current.client.send(message);
     } else {
-      console.log('Socket not ready, queuing', type);
-      messageQueue.current.push(message);
+      debugLog('[Signaling] drop (socket not ready)', { type, callId, peerId });
     }
-  }, [isReady]);
+  }, [callId, isReady, peerId]);
 
   // Typed helper functions for common signaling messages
   const sendOffer = useCallback((offer: RTCSessionDescriptionInit) => {
@@ -94,6 +94,8 @@ export function useSignaling({
   useEffect(() => {
     const shouldConnect = Boolean(enabled && callId && (!requirePeerId || peerId));
 
+    debugLog('[Signaling] effect', { shouldConnect, enabled, callId, peerId, requirePeerId });
+
     if (!shouldConnect) {
       if (subscriptionRef.current) {
         subscriptionRef.current.unsubscribe();
@@ -106,20 +108,18 @@ export function useSignaling({
     const subscription = subscribeToSignaling(callId as string, peerId, {
       onOpen: () => {
         setIsReady(true);
-        // Flush message queue when socket becomes ready
-        if (messageQueue.current.length > 0) {
-          console.log('Flushing message queue:', messageQueue.current.length);
-          messageQueue.current.forEach(msg => subscription.client.send(msg));
-          messageQueue.current = [];
-        }
+        debugLog('[Signaling] ws open', { callId, peerId });
       },
       onReconnecting: () => {
         setIsReady(false);
+        debugLog('[Signaling] ws reconnecting', { callId, peerId });
       },
       onReconnected: () => {
         setIsReady(true);
+        debugLog('[Signaling] ws reconnected', { callId, peerId });
       },
       onJoin: (data) => {
+        debugLog('[Signaling] join', { callId, peerId, data });
         if (data?.peer_id) {
           const peerRole = (data.role as PeerRole) ?? 'host';
           setRole(peerRole);
@@ -130,26 +130,32 @@ export function useSignaling({
         handlers.current.onPeerJoined();
       },
       onState: (data) => {
+        debugLog('[Signaling] state', { callId, peerId, status: data.status, participants: data.participants?.count });
         setCallStatus(data.status);
         setParticipants(data.participants?.count ?? 1);
         stateCallbackRef.current?.(data.status, data.participants?.count ?? 1);
       },
       onOffer: (message) => {
+        debugLog('[Signaling] recv offer', { callId, peerId, from: message.from });
         handlers.current.onOffer(message.data);
       },
       onAnswer: (message) => {
+        debugLog('[Signaling] recv answer', { callId, peerId, from: message.from });
         handlers.current.onAnswer(message.data);
       },
       onIceCandidate: (message) => {
+        debugLog('[Signaling] recv candidate', { callId, peerId, from: message.from });
         handlers.current.onCandidate(message.data);
       },
       onLeave: () => {
+        debugLog('[Signaling] leave', { callId, peerId });
         setCallStatus('ended');
         setParticipants(1);
         handlers.current.onPeerLeft();
         leaveCallbackRef.current?.();
       },
       onMessage: (message) => {
+        debugLog('[Signaling] recv message', { callId, peerId, type: message.type, from: message.from });
         // Handle extended signaling messages
         if (message.type === 'peer-disconnected') {
           handlers.current.onPeerDisconnected();
@@ -161,9 +167,11 @@ export function useSignaling({
       },
       onClose: () => {
         setIsReady(false);
+        debugLog('[Signaling] ws close', { callId, peerId });
       },
       onError: () => {
         setIsReady(false);
+        debugWarn('[Signaling] ws error', { callId, peerId });
       },
     });
 
